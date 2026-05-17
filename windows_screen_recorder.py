@@ -150,6 +150,7 @@ import time
 import tkinter as tk
 import tkinter.font as tk_font
 import tkinter.messagebox as tk_messagebox
+from tkinter import ttk
 import traceback
 from ctypes import wintypes
 from fractions import Fraction
@@ -238,17 +239,44 @@ KEYFRAME_INTERVAL_FRAMES: Final[int] = 2 * TARGET_OUTPUT_FRAMES_PER_SECOND
 # ============================================================================
 # Section 3 - Operator GUI configuration constants
 # ============================================================================
+#
+# The operator GUI is built entirely from ttk widgets arranged via the grid
+# geometry manager with explicit column and row weights, so the layout
+# behaves the same way a wxWidgets BoxSizer + GridSizer + stretch-spacer
+# composition behaves. Every dimension below is expressed as a multiple of
+# the platform's TkDefaultFont em width or line height - there are no
+# hard-coded pixel dimensions or fixed point sizes anywhere in the GUI.
+# This makes the GUI scale coherently with the Microsoft Windows display-
+# scaling slider and the "Make text bigger" accessibility setting (both of
+# which TkDefaultFont reflects automatically at process start).
 
-GUI_WINDOW_FIXED_WIDTH_PIXELS: Final[int] = 460
-GUI_WINDOW_FIXED_HEIGHT_PIXELS: Final[int] = 360
 GUI_WINDOW_TITLE_TEXT: Final[str] = APP_DISPLAY_TITLE
 GUI_STATUS_POLL_INTERVAL_MILLISECONDS: Final[int] = 200
-GUI_BUTTON_FONT_FAMILY: Final[str] = "Segoe UI"
-GUI_BUTTON_FONT_SIZE_POINTS: Final[int] = 11
-GUI_STATUS_FONT_FAMILY: Final[str] = "Segoe UI"
-GUI_STATUS_FONT_SIZE_POINTS: Final[int] = 10
-GUI_TITLE_BANNER_FONT_FAMILY: Final[str] = "Segoe UI Semibold"
-GUI_TITLE_BANNER_FONT_SIZE_POINTS: Final[int] = 11
+
+# Outer padding between the window edge and the content frame, expressed
+# as a multiple of one em (the pixel width of "0" in TkDefaultFont).
+GUI_OUTER_PADDING_EM_FRACTION: Final[float] = 1.0
+# Inner padding between consecutive widgets inside the content frame.
+GUI_INNER_PADDING_EM_FRACTION: Final[float] = 0.5
+
+# The title banner uses the same font family as TkDefaultFont, bolded,
+# and this many extra typographic points larger. At a default 10pt UI
+# font this produces a 14pt bold banner.
+GUI_TITLE_BANNER_EXTRA_POINTS: Final[int] = 4
+
+# Minimum width of each button, in characters. ttk.Button's ``width``
+# option is measured in characters so this floor scales correctly with
+# the operator's system font size. The longest button text in any state
+# is "Force-Cancel Finalize" (21 characters) so 22 gives a one-character
+# margin and aligns every button at the same width.
+GUI_BUTTON_MINIMUM_WIDTH_CHARACTERS: Final[int] = 22
+
+# Initial label wrap width, expressed as a multiple of one em. Long
+# status strings wrap at this width so the GUI opens at a reasonable
+# initial size without spanning the full screen horizontally. The
+# operator can drag the window wider; each wrappable label is bound to
+# its <Configure> event and re-flows its text to fill the new width.
+GUI_INITIAL_LABEL_WRAPLENGTH_EM: Final[float] = 60.0
 
 
 # ============================================================================
@@ -2984,7 +3012,25 @@ _GUI_BUTTON_CONFIGURATION_PER_STATE: Final[
 
 
 class _OperatorTkinterGui:
-    """The small fixed-size operator GUI window on Display 2.
+    """The operator GUI window placed on Microsoft Windows Display 2.
+
+    The widget tree is assembled entirely from ttk widgets and arranged
+    via the grid geometry manager with explicit column and row weights
+    and ``sticky`` parameters, so the layout behaves the same way a
+    wxWidgets BoxSizer + GridSizer + stretch-spacer composition behaves:
+    every widget grows or shrinks predictably as the operator resizes
+    the window, the button cluster stays anchored to the bottom of the
+    content area, and the status / details labels reflow their text to
+    fill the current window width.
+
+    No dimension below this point is a hard-coded pixel value or a
+    hard-coded typographic point size. Window initial size, widget
+    padding, label wrap width, and button minimum width are all
+    expressed as a multiple of the platform's TkDefaultFont em width or
+    line height. Microsoft Windows display scaling and the "Make text
+    bigger" accessibility setting are both reflected in TkDefaultFont's
+    point size at process start, so the GUI scales coherently with
+    whatever the operator has configured.
 
     Responsibilities (deliberately small):
 
@@ -3020,11 +3066,16 @@ class _OperatorTkinterGui:
         self._tk_root: Optional[tk.Tk] = None
         self._status_text_string_var: Optional[tk.StringVar] = None
         self._details_text_string_var: Optional[tk.StringVar] = None
-        self._start_button: Optional[tk.Button] = None
-        self._pause_resume_button: Optional[tk.Button] = None
-        self._stop_button: Optional[tk.Button] = None
-        self._force_cancel_button: Optional[tk.Button] = None
-        self._force_cancel_button_packed_into_layout: bool = False
+        self._start_button: Optional[ttk.Button] = None
+        self._pause_resume_button: Optional[ttk.Button] = None
+        self._stop_button: Optional[ttk.Button] = None
+        self._force_cancel_button: Optional[ttk.Button] = None
+        # True while the force-cancel button is grid()'d into the
+        # buttons sub-frame, False while it is grid_remove()'d. The
+        # grid_remove() API preserves every grid setting (row, column,
+        # sticky, padx, pady) so toggling visibility is cheap and the
+        # layout snaps back identically when the button reappears.
+        self._force_cancel_button_grid_visible: bool = False
         # Tracks the most recently-displayed asynchronous fatal
         # exception so we don't pop up the same messagebox repeatedly
         # from the poll loop.
@@ -3037,12 +3088,34 @@ class _OperatorTkinterGui:
     def construct_and_run_blocking(self) -> None:
         self._tk_root = tk.Tk()
         self._tk_root.title(GUI_WINDOW_TITLE_TEXT)
-        self._place_window_centered_on_microsoft_windows_display_2()
-        self._tk_root.resizable(False, False)
+
+        # Activate the modern ttk Microsoft Windows theme so labels,
+        # buttons and separators get the standard Windows 10 / 11
+        # visual style. We try the Windows-native themes in priority
+        # order and silently fall back to the cross-platform 'clam'
+        # theme if every native theme is unavailable (eg under Wine).
+        try:
+            ttk_style = ttk.Style(self._tk_root)
+            available_ttk_theme_names = set(ttk_style.theme_names())
+            for candidate_theme_name in (
+                "vista",
+                "xpnative",
+                "winnative",
+                "clam",
+            ):
+                if candidate_theme_name in available_ttk_theme_names:
+                    ttk_style.theme_use(candidate_theme_name)
+                    break
+        except tk.TclError:
+            pass
+
+        # Tool-window decoration: a slim title bar with only the close
+        # box, matching the look of a Microsoft Windows tool palette.
         try:
             self._tk_root.attributes("-toolwindow", True)
         except tk.TclError:
             pass
+
         # Intercept the OS close (X) button so a recording cannot be
         # quietly abandoned mid-stream.
         self._tk_root.protocol(
@@ -3051,6 +3124,28 @@ class _OperatorTkinterGui:
         )
 
         self._construct_all_widgets()
+
+        # Allow the operator to resize the window. The minimum size is
+        # the natural requested size of the widget tree after layout -
+        # below that, ttk would clip labels or buttons, which was the
+        # exact failure mode the previous fixed-pixel layout exhibited
+        # under non-default Microsoft Windows display scaling.
+        self._tk_root.resizable(True, True)
+        self._tk_root.update_idletasks()
+        natural_requested_window_width_pixels = (
+            self._tk_root.winfo_reqwidth()
+        )
+        natural_requested_window_height_pixels = (
+            self._tk_root.winfo_reqheight()
+        )
+        self._tk_root.minsize(
+            natural_requested_window_width_pixels,
+            natural_requested_window_height_pixels,
+        )
+        self._place_window_on_microsoft_windows_display_2(
+            window_width_pixels=natural_requested_window_width_pixels,
+            window_height_pixels=natural_requested_window_height_pixels,
+        )
 
         # Initial refresh + start the periodic poll.
         self._refresh_gui_for_current_state()
@@ -3063,20 +3158,111 @@ class _OperatorTkinterGui:
     # ============== Widget construction ==============
 
     def _construct_all_widgets(self) -> None:
-        assert self._tk_root is not None
-        title_banner_label = tk.Label(
-            self._tk_root,
-            text=GUI_WINDOW_TITLE_TEXT,
-            font=tk_font.Font(
-                family=GUI_TITLE_BANNER_FONT_FAMILY,
-                size=GUI_TITLE_BANNER_FONT_SIZE_POINTS,
-            ),
-            anchor="w",
-            padx=12,
-            pady=8,
-        )
-        title_banner_label.pack(fill=tk.X)
+        """Build the entire widget tree using ttk + grid sizing.
 
+        The layout is a single vertical column of widgets inside an
+        outer content frame. Row indices and weights are explicit so
+        the layout behaves identically whatever the operator's display
+        scaling and font-size accessibility settings are:
+
+          row 0 : title banner label              (weight=0, sticky="ew")
+          row 1 : separator                        (weight=0, sticky="ew")
+          row 2 : configuration description label  (weight=0, sticky="ew")
+          row 3 : separator                        (weight=0, sticky="ew")
+          row 4 : status label                     (weight=0, sticky="ew")
+          row 5 : details label                    (weight=0, sticky="ew")
+          row 6 : stretch spacer                   (weight=1, sticky="nsew")
+          row 7 : separator                        (weight=0, sticky="ew")
+          row 8 : buttons sub-frame                (weight=0, sticky="ew")
+
+        The stretch spacer at row 6 is the wxWidgets
+        ``AddStretchSpacer(1)`` pattern: it absorbs all vertical growth
+        when the operator drags the window taller, keeping the button
+        cluster anchored against the bottom edge of the content area.
+        Every horizontal widget has ``sticky="ew"`` so it stretches
+        with the window width.
+        """
+        assert self._tk_root is not None
+
+        # Resolve TkDefaultFont and derive every dimension below from
+        # its em width / line height. We deliberately do NOT hard-code
+        # a pixel padding or a point size anywhere past this point.
+        default_font = tk_font.nametofont("TkDefaultFont")
+        em_width_pixels = max(1, default_font.measure("0"))
+        outer_pad_pixels = max(
+            1, int(round(em_width_pixels * GUI_OUTER_PADDING_EM_FRACTION))
+        )
+        inner_pad_pixels = max(
+            1, int(round(em_width_pixels * GUI_INNER_PADDING_EM_FRACTION))
+        )
+        initial_wraplength_pixels = max(
+            1,
+            int(round(
+                em_width_pixels * GUI_INITIAL_LABEL_WRAPLENGTH_EM
+            )),
+        )
+
+        # Title banner font: same family as TkDefaultFont, bolded and
+        # a few points larger. Positive point sizes scale with the
+        # system DPI the same way TkDefaultFont does.
+        default_font_point_size = default_font.cget("size")
+        if default_font_point_size <= 0:
+            # Negative sizes are pixel sizes; convert to a sensible
+            # positive point-size baseline for the banner derivation.
+            default_font_point_size = 10
+        title_banner_font = tk_font.Font(
+            self._tk_root,
+            family=default_font.cget("family"),
+            size=(
+                default_font_point_size + GUI_TITLE_BANNER_EXTRA_POINTS
+            ),
+            weight="bold",
+        )
+
+        # Root window grid: single stretching column, single
+        # stretching row that hosts the content frame.
+        self._tk_root.columnconfigure(0, weight=1)
+        self._tk_root.rowconfigure(0, weight=1)
+
+        # The content frame's ``padding`` is the outer-margin gap
+        # between the window edge and the first widget on every side.
+        content_frame = ttk.Frame(
+            self._tk_root,
+            padding=(
+                outer_pad_pixels,
+                outer_pad_pixels,
+                outer_pad_pixels,
+                outer_pad_pixels,
+            ),
+        )
+        content_frame.grid(row=0, column=0, sticky="nsew")
+        content_frame.columnconfigure(0, weight=1)
+        # Row 6 is the stretch spacer; all other rows are natural-sized.
+        content_frame.rowconfigure(6, weight=1)
+
+        # --- row 0: title banner label ----------------------------------
+        title_banner_label = ttk.Label(
+            content_frame,
+            text=GUI_WINDOW_TITLE_TEXT,
+            font=title_banner_font,
+            anchor="w",
+        )
+        title_banner_label.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+
+        # --- row 1: separator -------------------------------------------
+        ttk.Separator(content_frame, orient="horizontal").grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+
+        # --- row 2: configuration description label ---------------------
         d1 = (
             self._initial_display_config
             .microsoft_windows_display_1_primary_to_be_recorded
@@ -3085,8 +3271,8 @@ class _OperatorTkinterGui:
             self._initial_display_config
             .microsoft_windows_display_2_secondary_for_operator_gui
         )
-        configuration_description_label = tk.Label(
-            self._tk_root,
+        configuration_description_label = ttk.Label(
+            content_frame,
             text=(
                 "Recording target: Display 1 "
                 "(Microsoft Windows primary)\n"
@@ -3100,115 +3286,234 @@ class _OperatorTkinterGui:
             ),
             justify="left",
             anchor="w",
-            font=tk_font.Font(
-                family=GUI_STATUS_FONT_FAMILY,
-                size=GUI_STATUS_FONT_SIZE_POINTS,
-            ),
-            padx=12,
-            pady=4,
         )
-        configuration_description_label.pack(fill=tk.X)
+        configuration_description_label.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+        self._bind_label_to_dynamic_wraplength(
+            configuration_description_label,
+            initial_wraplength_pixels,
+        )
 
+        # --- row 3: separator -------------------------------------------
+        ttk.Separator(content_frame, orient="horizontal").grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+
+        # --- row 4: status label ----------------------------------------
         self._status_text_string_var = tk.StringVar(value="")
-        status_label = tk.Label(
-            self._tk_root,
+        status_label = ttk.Label(
+            content_frame,
             textvariable=self._status_text_string_var,
             justify="left",
             anchor="w",
-            font=tk_font.Font(
-                family=GUI_STATUS_FONT_FAMILY,
-                size=GUI_STATUS_FONT_SIZE_POINTS,
-            ),
-            padx=12,
-            pady=4,
-            wraplength=GUI_WINDOW_FIXED_WIDTH_PIXELS - 24,
         )
-        status_label.pack(fill=tk.X)
+        status_label.grid(
+            row=4,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+        self._bind_label_to_dynamic_wraplength(
+            status_label,
+            initial_wraplength_pixels,
+        )
 
+        # --- row 5: details label ---------------------------------------
         self._details_text_string_var = tk.StringVar(value="")
-        details_label = tk.Label(
-            self._tk_root,
+        details_label = ttk.Label(
+            content_frame,
             textvariable=self._details_text_string_var,
             justify="left",
             anchor="w",
-            font=tk_font.Font(
-                family=GUI_STATUS_FONT_FAMILY,
-                size=GUI_STATUS_FONT_SIZE_POINTS,
-            ),
-            padx=12,
-            pady=4,
-            wraplength=GUI_WINDOW_FIXED_WIDTH_PIXELS - 24,
         )
-        details_label.pack(fill=tk.X)
-
-        buttons_frame = tk.Frame(self._tk_root, padx=12, pady=12)
-        buttons_frame.pack(fill=tk.X)
-
-        button_font = tk_font.Font(
-            family=GUI_BUTTON_FONT_FAMILY,
-            size=GUI_BUTTON_FONT_SIZE_POINTS,
+        details_label.grid(
+            row=5,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
         )
-        self._start_button = tk.Button(
+        self._bind_label_to_dynamic_wraplength(
+            details_label,
+            initial_wraplength_pixels,
+        )
+
+        # --- row 6: vertical stretch spacer -----------------------------
+        # Empty ttk.Frame whose row has weight=1; this absorbs every
+        # vertical pixel the operator gains by dragging the window
+        # taller, keeping the button cluster glued to the bottom edge
+        # of the content area. (wxWidgets equivalent: AddStretchSpacer.)
+        stretch_spacer_frame = ttk.Frame(content_frame)
+        stretch_spacer_frame.grid(row=6, column=0, sticky="nsew")
+
+        # --- row 7: separator above the buttons -------------------------
+        ttk.Separator(content_frame, orient="horizontal").grid(
+            row=7,
+            column=0,
+            sticky="ew",
+            pady=(0, inner_pad_pixels),
+        )
+
+        # --- row 8: buttons sub-frame -----------------------------------
+        buttons_frame = ttk.Frame(content_frame)
+        buttons_frame.grid(row=8, column=0, sticky="ew")
+        buttons_frame.columnconfigure(0, weight=1)
+
+        # Buttons are stacked vertically. Each button gets a top-pad
+        # except the first; this way the bottom of the cluster has no
+        # phantom padding, regardless of whether the (conditionally
+        # visible) force-cancel button is grid'd in.
+        self._start_button = ttk.Button(
             buttons_frame,
             text="Start Recording",
             command=self._on_operator_pressed_start_recording_button,
-            font=button_font,
+            width=GUI_BUTTON_MINIMUM_WIDTH_CHARACTERS,
         )
-        self._start_button.pack(fill=tk.X, pady=3)
-        self._pause_resume_button = tk.Button(
+        self._start_button.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+        )
+        self._pause_resume_button = ttk.Button(
             buttons_frame,
             text="Pause",
             command=(
                 self._on_operator_pressed_pause_or_resume_button
             ),
-            font=button_font,
+            width=GUI_BUTTON_MINIMUM_WIDTH_CHARACTERS,
             state=tk.DISABLED,
         )
-        self._pause_resume_button.pack(fill=tk.X, pady=3)
-        self._stop_button = tk.Button(
+        self._pause_resume_button.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(inner_pad_pixels, 0),
+        )
+        self._stop_button = ttk.Button(
             buttons_frame,
             text="Stop Recording",
             command=self._on_operator_pressed_stop_recording_button,
-            font=button_font,
+            width=GUI_BUTTON_MINIMUM_WIDTH_CHARACTERS,
             state=tk.DISABLED,
         )
-        self._stop_button.pack(fill=tk.X, pady=3)
-        # Force-cancel button: built but not packed initially. We pack
-        # / pack_forget it based on state in _refresh_gui_for_current_state.
-        self._force_cancel_button = tk.Button(
+        self._stop_button.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(inner_pad_pixels, 0),
+        )
+        # Force-cancel button: built but not grid'd initially. We
+        # toggle it in / out of the layout via grid() / grid_remove()
+        # inside _refresh_gui_for_current_state. grid_remove preserves
+        # every grid setting (row, column, sticky, padx, pady) so a
+        # subsequent grid() call snaps the button back to row 3 with
+        # the same spacing as the other buttons.
+        self._force_cancel_button = ttk.Button(
             buttons_frame,
             text="Force-Cancel Finalize",
             command=(
                 self._on_operator_pressed_force_cancel_button
             ),
-            font=button_font,
+            width=GUI_BUTTON_MINIMUM_WIDTH_CHARACTERS,
             state=tk.DISABLED,
         )
+        # Pre-register the force-cancel button in its target grid
+        # cell, then immediately remove it from the layout. The first
+        # grid() establishes the (row, column, sticky, pady) tuple
+        # that grid_remove()/grid() will preserve.
+        self._force_cancel_button.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(inner_pad_pixels, 0),
+        )
+        self._force_cancel_button.grid_remove()
+        self._force_cancel_button_grid_visible = False
+
+    def _bind_label_to_dynamic_wraplength(
+        self,
+        label: ttk.Label,
+        initial_wraplength_pixels: int,
+    ) -> None:
+        """Make ``label.wraplength`` track the label's current width.
+
+        Without this binding a ttk.Label with multi-line text refuses
+        to wrap dynamically: it keeps the wraplength it was given at
+        construction time, and any text wider than that wraplength
+        either clips or, if no wraplength was given, pushes the
+        containing window arbitrarily wide. (That second failure mode
+        is the runaway-horizontal-growth behaviour the previous fixed-
+        pixel layout exhibited at high Microsoft Windows display
+        scaling.)
+
+        With this binding the label rewraps every time the operator
+        drags the window edges - narrower text wraps to more lines,
+        wider text consolidates to fewer lines.
+
+        The initial wraplength bounds the label's natural requested
+        width at construction time (before the first <Configure> event
+        fires) so the window opens at a sane initial size.
+        """
+        label.configure(wraplength=initial_wraplength_pixels)
+        # Guard against redundant configure() round-trips: only update
+        # wraplength when the actual width has changed by a meaningful
+        # amount. (Tkinter rarely fires <Configure> for unchanged
+        # widths but the guard is cheap.)
+        last_applied_wraplength_pixels = [initial_wraplength_pixels]
+
+        def on_label_configure_event(event: "tk.Event[Any]") -> None:
+            # Subtract 2px to absorb the ttk theme's internal label
+            # border so text never reaches the very edge of the label
+            # widget; clamp to a sane lower bound so a degenerate
+            # event.width=0 cannot make wraplength=0 (which would
+            # render the label invisible).
+            new_wraplength_pixels = max(50, event.width - 2)
+            if (
+                new_wraplength_pixels
+                == last_applied_wraplength_pixels[0]
+            ):
+                return
+            last_applied_wraplength_pixels[0] = new_wraplength_pixels
+            label.configure(wraplength=new_wraplength_pixels)
+
+        label.bind("<Configure>", on_label_configure_event)
 
     # ============== Window placement on Display 2 ==============
 
-    def _place_window_centered_on_microsoft_windows_display_2(
+    def _place_window_on_microsoft_windows_display_2(
         self,
+        *,
+        window_width_pixels: int,
+        window_height_pixels: int,
     ) -> None:
+        """Place the window centered on Microsoft Windows Display 2.
+
+        Window width and height come from the laid-out widget tree's
+        natural requested size; this method only decides where on the
+        secondary display to place that window.
+        """
         assert self._tk_root is not None
         d2 = (
             self._initial_display_config
             .microsoft_windows_display_2_secondary_for_operator_gui
         )
-        upper_left_x = d2.bounding_rectangle_left + max(
+        upper_left_x_pixels = d2.bounding_rectangle_left + max(
             0,
-            (d2.bounding_rectangle_width - GUI_WINDOW_FIXED_WIDTH_PIXELS)
-            // 2,
+            (d2.bounding_rectangle_width - window_width_pixels) // 2,
         )
-        upper_left_y = d2.bounding_rectangle_top + max(
+        upper_left_y_pixels = d2.bounding_rectangle_top + max(
             0,
-            (d2.bounding_rectangle_height - GUI_WINDOW_FIXED_HEIGHT_PIXELS)
-            // 2,
+            (d2.bounding_rectangle_height - window_height_pixels) // 2,
         )
         self._tk_root.geometry(
-            f"{GUI_WINDOW_FIXED_WIDTH_PIXELS}x"
-            f"{GUI_WINDOW_FIXED_HEIGHT_PIXELS}+"
-            f"{upper_left_x}+{upper_left_y}"
+            f"{window_width_pixels}x{window_height_pixels}+"
+            f"{upper_left_x_pixels}+{upper_left_y_pixels}"
         )
         self._tk_root.update_idletasks()
 
@@ -3607,10 +3912,15 @@ class _OperatorTkinterGui:
         )
 
         # Force-cancel button: visibility + enabled-after-delay logic.
+        # We use grid_remove() / grid() rather than pack_forget() /
+        # pack() so the button preserves every grid setting (row,
+        # column, sticky, padx, pady) across visibility toggles and
+        # snaps back into row 3 of the buttons sub-frame identically
+        # each time.
         if button_config.force_cancel_button_visible:
-            if not self._force_cancel_button_packed_into_layout:
-                self._force_cancel_button.pack(fill=tk.X, pady=3)
-                self._force_cancel_button_packed_into_layout = True
+            if not self._force_cancel_button_grid_visible:
+                self._force_cancel_button.grid()
+                self._force_cancel_button_grid_visible = True
             elapsed = (
                 self._controller
                 .seconds_elapsed_since_finalization_started()
@@ -3624,9 +3934,9 @@ class _OperatorTkinterGui:
                 state=tk.NORMAL if allow else tk.DISABLED
             )
         else:
-            if self._force_cancel_button_packed_into_layout:
-                self._force_cancel_button.pack_forget()
-                self._force_cancel_button_packed_into_layout = False
+            if self._force_cancel_button_grid_visible:
+                self._force_cancel_button.grid_remove()
+                self._force_cancel_button_grid_visible = False
 
 
 # ============================================================================
