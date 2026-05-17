@@ -2796,7 +2796,55 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             output_stream.width = self._width
             output_stream.height = self._height
             output_stream.pix_fmt = "nv12"
+            # Time-base of the AVStream inside the output container.
+            # The mp4 muxer rescales every muxed packet's PTS from
+            # ``packet.time_base`` into this stream time-base before
+            # writing it into the file's per-track timescale, so this
+            # is the unit the output MP4 ultimately stores PTS values
+            # in.
             output_stream.time_base = Fraction(
+                1, TARGET_OUTPUT_FRAMES_PER_SECOND
+            )
+            # Time-base of the libavcodec ``AVCodecContext``, which
+            # is a DIFFERENT field from ``AVStream.time_base`` and
+            # must be set independently. PyAV's
+            # ``stream.time_base = ...`` only writes the AVStream
+            # field; it does not propagate to the codec context.
+            #
+            # We force them equal here on purpose. The reason is
+            # FFmpeg's H.264 codec descriptor declares
+            # ``ticks_per_frame = 2`` (the legacy interlaced-fields
+            # convention from
+            # ``libavcodec/codec_desc.c::AV_CODEC_PROP_REORDER``-
+            # adjacent defaults), so if we leave
+            # ``avctx->time_base`` unset and only set
+            # ``avctx->framerate = TARGET_OUTPUT_FRAMES_PER_SECOND``
+            # via the ``rate`` argument to ``add_stream``, libavcodec
+            # picks a default of
+            # ``1 / (ticks_per_frame * framerate)`` =
+            # ``1 / (2 * TARGET_OUTPUT_FRAMES_PER_SECOND)`` =
+            # ``1 / 60`` for our target rate. PyAV then propagates
+            # that 1/60 onto every emitted output ``av.Packet`` via
+            # ``CodecContext._setup_encoded_packet`` line
+            # ``packet.ptr.time_base = self.ptr.time_base``. When
+            # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+            # below overwrites ``output_packet.pts`` with the
+            # FIFO-popped value (computed by the capture worker in
+            # stream time-base units of
+            # ``1 / TARGET_OUTPUT_FRAMES_PER_SECOND`` seconds per
+            # unit, ie 1/30 for the default 30 fps target),
+            # ``output_container.mux(...)`` rescales it from the
+            # packet's 1/60 time-base into the stream's 1/30 time-
+            # base - halving the PTS value en route, halving the
+            # output MP4's playback duration, and surfacing as a
+            # 2x-faster-than-real-time playback to the operator.
+            #
+            # Setting ``codec_context.time_base`` equal to
+            # ``stream.time_base`` here eliminates that rescale by
+            # making it the identity transformation. The post-open
+            # validator below cross-checks that libavcodec did not
+            # silently override this value during ``avcodec_open2``.
+            output_stream.codec_context.time_base = Fraction(
                 1, TARGET_OUTPUT_FRAMES_PER_SECOND
             )
             output_stream.codec_context.options = {
@@ -3642,6 +3690,76 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 f"  Observed pix_fmt : {observed_pix_fmt_value!r}"
             )
 
+        # (8)-(9) Time-base agreement between the libavcodec
+        # ``AVCodecContext`` and the libavformat ``AVStream``. Both
+        # must equal ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``
+        # so that the FIFO-popped PTS values this program writes onto
+        # ``output_packet.pts`` in
+        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+        # are NOT silently rescaled by libavformat's
+        # ``av_interleaved_write_frame`` on the way into the mp4
+        # muxer. If the codec context's time-base disagrees with the
+        # stream's time-base, the muxer rescales the packet's PTS by
+        # the ratio between them - which is the precise failure mode
+        # that surfaced as "output MP4 plays back at exactly 2x real
+        # time" on the reference target hardware before this check
+        # was added (FFmpeg defaulted ``codec_context.time_base`` to
+        # ``1 / (ticks_per_frame * framerate) = 1 / 60`` for an H.264
+        # codec descriptor with ``ticks_per_frame = 2`` and the
+        # ``framerate`` argument we pass into ``add_stream``, while
+        # ``stream.time_base`` was explicitly set to ``1 / 30``;
+        # every muxed PTS was halved on the way out).
+        expected_time_base_in_stream_time_base_units = Fraction(
+            1, TARGET_OUTPUT_FRAMES_PER_SECOND
+        )
+        observed_codec_context_time_base_value = (
+            codec_context.time_base
+        )
+        if (
+            observed_codec_context_time_base_value
+            != expected_time_base_in_stream_time_base_units
+        ):
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.time_base`` does not match the "
+                f"value this program requires for the FIFO-popped "
+                f"PTS / DTS overrides in "
+                f"``_mux_one_encoded_packet_with_synthesized_pts_and_dts`` "
+                f"to be muxed without rescaling.\n"
+                f"  Expected ``codec_context.time_base`` : "
+                f"{expected_time_base_in_stream_time_base_units} "
+                f"(= 1 / TARGET_OUTPUT_FRAMES_PER_SECOND)\n"
+                f"  Observed ``codec_context.time_base`` : "
+                f"{observed_codec_context_time_base_value}\n"
+                f"This typically indicates that libavcodec's "
+                f"``avcodec_open2`` overrode the explicit "
+                f"``codec_context.time_base`` this program set "
+                f"before ``open()``, in favour of the H.264 codec "
+                f"descriptor's ``ticks_per_frame``-derived default "
+                f"of ``1 / (ticks_per_frame * framerate)``."
+            )
+        observed_stream_time_base_value = output_stream.time_base
+        if (
+            observed_stream_time_base_value
+            != expected_time_base_in_stream_time_base_units
+        ):
+            raise EncoderPipelineError(
+                f"FFmpeg's libavformat ``AVStream.time_base`` does "
+                f"not match the value this program requires for "
+                f"the FIFO-popped PTS / DTS overrides to be muxed "
+                f"without rescaling.\n"
+                f"  Expected ``stream.time_base`` : "
+                f"{expected_time_base_in_stream_time_base_units} "
+                f"(= 1 / TARGET_OUTPUT_FRAMES_PER_SECOND)\n"
+                f"  Observed ``stream.time_base`` : "
+                f"{observed_stream_time_base_value}\n"
+                f"This typically indicates that the mp4 muxer's "
+                f"``avformat_write_header`` adjusted the stream's "
+                f"time-base to one of its supported per-track "
+                f"timescales after this program's explicit "
+                f"assignment."
+            )
+
         self._logger.info(
             f"Encoder codec context post-open state passed every "
             f"explicit-configuration validation check: "
@@ -3652,7 +3770,11 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             f"equals input order), "
             f"gop_size={observed_gop_size_value}, "
             f"resolution={codec_context.width}x{codec_context.height}, "
-            f"pix_fmt={observed_pix_fmt_value!r}."
+            f"pix_fmt={observed_pix_fmt_value!r}, "
+            f"codec_context.time_base="
+            f"{observed_codec_context_time_base_value}, "
+            f"stream.time_base="
+            f"{observed_stream_time_base_value}."
         )
 
     def _discard_queue_remainder_due_to_force_cancel(self) -> None:
