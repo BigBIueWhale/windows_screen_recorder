@@ -49,11 +49,13 @@ On startup the program:
      controls: a status readout, a Start Recording button, a
      Pause / Resume toggle button, and a Stop Recording button.
 
-When the operator presses Start Recording, a fresh per-session output
-folder is created underneath the operator's Videos Known Folder, at the
-path::
+When the operator presses Start Recording, a fresh per-session
+scratch folder is created underneath the current user's per-user
+temporary directory (the path resolved by ``tempfile.gettempdir()``,
+which on a normally-installed Microsoft Windows workstation is
+``%LOCALAPPDATA%\\Temp\\``), at the path::
 
-    <Videos Known Folder>\\WindowsScreenRecorder\\<ISO-8601-session-id>\\
+    <Per-User Temporary Directory>\\WindowsScreenRecorder\\<ISO-8601-session-id>\\
 
 where ``<ISO-8601-session-id>`` is the local wall-clock instant of
 session start, formatted as ``YYYY-MM-DDTHH-MM-SS-FFFFFF`` (Microsoft
@@ -61,6 +63,28 @@ Windows reserves the colon character, so the canonical ISO 8601 colons
 are replaced with hyphens; microseconds eliminate same-second collisions
 even on a rapid Stop/Start cycle). This format sorts both alphabetically
 and chronologically.
+
+The recorder writes the fragmented-MP4 output container, the per-frame
+CSV log, the session metadata JSON, the display configuration JSON,
+and the session text log into this *scratch* folder while the session
+is running. On graceful Stop, every artifact is copied (via
+``shutil.copytree``, with all missing intermediate directories
+created) into the structurally identical path underneath the Videos
+Known Folder::
+
+    <Videos Known Folder>\\WindowsScreenRecorder\\<ISO-8601-session-id>\\
+
+The scratch folder is removed on successful publication. The
+scratch-then-publish split exists because the Microsoft Windows
+Videos Known Folder is frequently redirected (via Group Policy folder
+redirection or OneDrive Known Folder Move) onto an SMB / OneDrive
+backing store that *does* support large sequential bulk-copy but does
+*not* reliably support the seek-back-and-overwrite mid-stream I/O
+pattern that the fragmented-MP4 muxer issues per fragment. Local
+NTFS-backed temporary storage always supports that pattern. If the
+publication copy fails, the recording is preserved intact in the
+scratch folder; the GUI displays the scratch path and the operator
+can copy it manually.
 
 Each per-session output folder contains five forensic artifacts:
 
@@ -144,7 +168,9 @@ import logging
 import os
 import platform
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -328,6 +354,30 @@ class OutputFolderProvisioningError(ScreenRecorderError):
     """Could not create or write into the per-session output folder."""
 
 
+class PerUserTemporaryDirectoryUnusableError(ScreenRecorderError):
+    """The current user's per-user temporary directory cannot be used as a scratch root.
+
+    The recorder muxes its fragmented-MP4 output to a per-user temporary
+    scratch folder during the recording session, and copies the finished
+    session artifacts into the Videos Known Folder only on Stop. This
+    decoupling exists because the Microsoft Windows Videos Known Folder
+    is frequently redirected (via Group Policy folder redirection or
+    OneDrive Known Folder Move) onto an SMB / OneDrive backing store
+    that does not reliably support the seek-back-and-overwrite I/O
+    pattern the fragmented-MP4 muxer issues mid-stream. The per-user
+    temporary directory, in contrast, is always backed by the local
+    NTFS volume on a normally-installed Microsoft Windows workstation.
+    If the per-user temporary directory does not exist or is not a
+    directory at session-start, we refuse to record - the alternative
+    (silently falling back to an undefined location) would produce
+    forensic artifacts the operator cannot locate.
+    """
+
+
+class SessionPublicationToVideosLibraryError(ScreenRecorderError):
+    """Could not copy the per-session scratch folder into the Videos Known Folder."""
+
+
 class DisplayConfigurationValidationError(ScreenRecorderError):
     """The attached display monitors do not satisfy this app's requirements."""
 
@@ -500,6 +550,68 @@ _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2_HANDLE_VALUE: Final[int] = -4
 # on older Windows builds; we probe and fall back.
 
 
+# ----- MonitorFromPoint / GetDpiForMonitor ----------------------------------
+#
+# These bindings exist so we can ask Microsoft Windows for the effective DPI
+# of the *specific* monitor that the operator GUI will be placed onto
+# (Display 2), independently of whichever monitor is the primary. Required
+# because Tcl/Tk's Windows backend, even on a Per-Monitor-V2-aware process,
+# captures the screen DPI exactly once (in TkWinDisplayChanged inside
+# win/tkWinX.c) via ``GetDC(NULL); GetDeviceCaps(LOGPIXELSY)`` - and the
+# desktop-DC LOGPIXELSY value documented at
+#   https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dpi-related-apis-and-registry-settings
+# is "the DPI of the primary display at the time the Windows session was
+# started". So on a dual-monitor workstation whose Display 2 is at a
+# different scale than Display 1, Tcl/Tk's font metrics and ttk widget
+# sizes would be off by the ratio of those two DPI values - exactly as
+# documented in the open Tk ticket
+#   https://core.tcl-lang.org/tk/tktview?name=a9ee44102b
+# We work around this by *manually* fetching Display 2's effective DPI
+# via GetDpiForMonitor (which IS PMv2-aware) and re-scaling Tk before any
+# widget is constructed.
+
+# Microsoft Win32 ``MONITOR_DPI_TYPE`` enum value:
+#   MDT_EFFECTIVE_DPI  = 0  - the DPI scaled by the user's accessibility
+#                             settings; this is the value to drive
+#                             user-interface layout from.
+# See https://learn.microsoft.com/en-us/windows/win32/api/shellscalingapi/ne-shellscalingapi-monitor_dpi_type
+_MDT_EFFECTIVE_DPI_VALUE: Final[int] = 0
+
+# Microsoft Win32 ``MonitorFromPoint`` flag:
+#   MONITOR_DEFAULTTONEAREST = 0x00000002  - if the point is not inside
+#       any monitor, return the nearest monitor's HMONITOR handle. We
+#       always feed a point inside Display 2's bounding rectangle, but
+#       using the nearest-fallback flag keeps the call total instead
+#       of raising on a borderline pixel coordinate.
+# See https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfrompoint
+_MONITOR_DEFAULTTONEAREST_FLAG_VALUE: Final[int] = 0x00000002
+
+_user32.MonitorFromPoint.argtypes = [
+    wintypes.POINT,                            # POINT pt (by value)
+    wintypes.DWORD,                            # DWORD dwFlags
+]
+_user32.MonitorFromPoint.restype = wintypes.HMONITOR
+
+# GetDpiForMonitor lives in shcore.dll (Windows 8.1+). The reference
+# target host for this program is Windows 10 1703+, so shcore.dll is
+# always present; we still guard the GetProcAddress with try/except
+# in case the user is running an older or sandboxed Windows build.
+if _shcore is not None:
+    try:
+        _shcore.GetDpiForMonitor.argtypes = [
+            wintypes.HMONITOR,                 # HMONITOR hmonitor
+            ctypes.c_int,                      # MONITOR_DPI_TYPE dpiType
+            ctypes.POINTER(wintypes.UINT),     # UINT *dpiX (out)
+            ctypes.POINTER(wintypes.UINT),     # UINT *dpiY (out)
+        ]
+        _shcore.GetDpiForMonitor.restype = ctypes.HRESULT
+    except AttributeError:
+        # Older Windows build that ships shcore.dll without
+        # GetDpiForMonitor. The query helper below will detect this
+        # condition and fall back gracefully.
+        pass
+
+
 # ============================================================================
 # Section 7 - Microsoft Win32 helper functions
 # ============================================================================
@@ -564,6 +676,179 @@ def _opt_into_per_monitor_v2_dpi_awareness() -> None:
         "program does not target. The expected target host operating system "
         "is Microsoft Windows 10 version 1703 or later. Aborting."
     )
+
+
+# Microsoft Windows' nominal "logical DPI" baseline: at 100% display
+# scaling, GetDpiForMonitor reports this number of pixels per logical
+# inch. Every higher accessibility scale step is a multiple of this
+# (125% -> 120, 150% -> 144, 175% -> 168, 200% -> 192, ...). The Tcl/Tk
+# ``tk scaling`` command is in "pixels per point", where a point is
+# 1/72 of an inch by typographic convention, so converting an effective
+# DPI value into a tk-scaling factor is a pure division by 72.
+_MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE: Final[int] = 96
+_POINTS_PER_INCH_BY_TYPOGRAPHIC_CONVENTION: Final[int] = 72
+
+
+def _query_effective_dpi_pixels_per_inch_of_monitor_containing_pixel(
+    virtual_screen_x_pixel: int,
+    virtual_screen_y_pixel: int,
+) -> tuple[int, int]:
+    """Return ``(dpi_x, dpi_y)`` for the monitor containing the given pixel.
+
+    Uses ``MonitorFromPoint`` followed by ``GetDpiForMonitor`` with the
+    ``MDT_EFFECTIVE_DPI`` enum value so the result reflects the user's
+    Microsoft Windows "Change the size of text, apps, and other items"
+    accessibility scale setting for that specific monitor - not the
+    process-wide value, and not the primary monitor's value, both of
+    which would defeat the entire point of being Per-Monitor-V2 aware.
+
+    If either Win32 call fails (eg the host operating system predates
+    Windows 8.1 and ships a shcore.dll without GetDpiForMonitor, or
+    the point falls in a no-monitor coordinate-space gap that even
+    ``MONITOR_DEFAULTTONEAREST`` cannot resolve), this function falls
+    back to the Microsoft Windows logical-DPI baseline of 96 pixels
+    per inch for both axes - which is the right behavior for a host
+    on which DPI awareness is not a meaningful concept anyway.
+    """
+    # Guard: GetDpiForMonitor may be unavailable on pre-8.1 builds.
+    if _shcore is None or not hasattr(_shcore, "GetDpiForMonitor"):
+        return (
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+        )
+
+    target_point = wintypes.POINT(
+        virtual_screen_x_pixel,
+        virtual_screen_y_pixel,
+    )
+    target_monitor_handle = _user32.MonitorFromPoint(
+        target_point,
+        wintypes.DWORD(_MONITOR_DEFAULTTONEAREST_FLAG_VALUE),
+    )
+    if not target_monitor_handle:
+        return (
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+        )
+
+    effective_dpi_x_out = wintypes.UINT(0)
+    effective_dpi_y_out = wintypes.UINT(0)
+    try:
+        # ctypes auto-raises OSError on a failure HRESULT from
+        # GetDpiForMonitor (restype is ctypes.HRESULT). The function
+        # returns S_OK = 0 on success.
+        _shcore.GetDpiForMonitor(
+            target_monitor_handle,
+            ctypes.c_int(_MDT_EFFECTIVE_DPI_VALUE),
+            ctypes.byref(effective_dpi_x_out),
+            ctypes.byref(effective_dpi_y_out),
+        )
+    except OSError:
+        return (
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+            _MICROSOFT_WINDOWS_LOGICAL_DPI_BASELINE_AT_100_PERCENT_SCALE,
+        )
+
+    return (
+        int(effective_dpi_x_out.value),
+        int(effective_dpi_y_out.value),
+    )
+
+
+# Microsoft Windows named system fonts whose pixel metrics were cached
+# inside Tcl/Tk's font subsystem at ``Tk_Init`` time using the *primary*
+# monitor's DPI (via ``GetDC(NULL); GetDeviceCaps(LOGPIXELSY)`` inside
+# ``win/tkWinFont.c``'s TkWinSetupSystemFonts). When we later raise
+# ``tk scaling`` to the *target* monitor's DPI to fix multi-monitor
+# layouts, those cached pixel metrics do NOT auto-refresh - Tcl/Tk has
+# no ``WM_DPICHANGED`` handler whatsoever on Windows (confirmed by
+# grepping the Tk ``main`` branch for ``WM_DPICHANGED``, which returns
+# zero results). We therefore explicitly re-configure each named font
+# to its existing point size, which on the Tcl/Tk side triggers a font
+# re-derivation that *does* honor the new scaling.
+#
+# This is the complete set of named system fonts created by Tk at
+# startup. See https://www.tcl-lang.org/man/tcl9.0/TkCmd/font.htm
+_MICROSOFT_WINDOWS_TCL_TK_NAMED_SYSTEM_FONT_NAMES: Final[tuple[str, ...]] = (
+    "TkDefaultFont",
+    "TkTextFont",
+    "TkFixedFont",
+    "TkMenuFont",
+    "TkHeadingFont",
+    "TkCaptionFont",
+    "TkSmallCaptionFont",
+    "TkIconFont",
+    "TkTooltipFont",
+)
+
+
+def _apply_target_monitor_effective_dpi_to_tkinter_root(
+    tk_root: "tk.Tk",
+    target_monitor_effective_dpi_pixels_per_inch: int,
+) -> None:
+    """Re-scale Tcl/Tk to match the target monitor's effective DPI.
+
+    Must be called immediately after ``tk.Tk()`` and *before any
+    widget is constructed*. The Tcler's-Wiki ``tk scaling`` page is
+    explicit on the timing constraint: "Measurements made after the
+    scaling factor is changed will use the new scaling factor, but it
+    is undefined whether existing widgets will resize themselves
+    dynamically." So we set scaling early, then build widgets fresh
+    against the correct scaling.
+
+    Two steps:
+
+      1. ``tk scaling`` is set to the target monitor's pixels-per-point
+         ratio (DPI / 72). Future font measurements and widget natural
+         sizes will use this ratio.
+
+      2. Each Microsoft Windows named system font (``TkDefaultFont``,
+         ``TkTextFont``, ``TkFixedFont``, etc.) is re-configured to its
+         existing point size. Tcl/Tk does not refresh those fonts'
+         cached pixel metrics in response to a ``tk scaling`` change;
+         re-configuring with the same logical size triggers a font
+         re-derivation that does honor the new scaling.
+
+    After this returns, ``font.measure("0")`` against ``TkDefaultFont``
+    reflects target-monitor pixels, ttk button heights match what
+    will physically render, and ``winfo_reqheight()`` after a layout
+    pass returns target-monitor-pixel-correct values.
+    """
+    new_tk_scaling_pixels_per_point = (
+        target_monitor_effective_dpi_pixels_per_inch
+        / _POINTS_PER_INCH_BY_TYPOGRAPHIC_CONVENTION
+    )
+    try:
+        tk_root.tk.call(
+            "tk",
+            "scaling",
+            new_tk_scaling_pixels_per_point,
+        )
+    except tk.TclError:
+        # If the Tcl/Tk build does not accept a floating-point scaling
+        # value (extremely unlikely on Microsoft Windows; would only
+        # happen on a deeply broken Tk install), there is nothing more
+        # we can do - the rest of the program will still run.
+        return
+
+    for named_font_name in _MICROSOFT_WINDOWS_TCL_TK_NAMED_SYSTEM_FONT_NAMES:
+        try:
+            named_font = tk_font.nametofont(named_font_name)
+        except tk.TclError:
+            # Not every named font exists on every Microsoft Windows
+            # build (eg TkHeadingFont is platform-conditional). Skip
+            # silently and continue.
+            continue
+        current_size = named_font.cget("size")
+        # Tcl/Tk font sizes are positive integers for points and
+        # negative integers for direct pixels. Re-deriving makes
+        # sense only for point-size fonts; pixel-size fonts already
+        # bypass the DPI conversion that ``tk scaling`` controls.
+        if isinstance(current_size, int) and current_size > 0:
+            try:
+                named_font.configure(size=current_size)
+            except tk.TclError:
+                continue
 
 
 def _resolve_current_user_videos_known_folder_path() -> Path:
@@ -1017,15 +1302,35 @@ def verify_intel_quick_sync_video_h264_encoder_available() -> None:
 
 @dataclasses.dataclass(frozen=True)
 class PerSessionOutputFolderArtifactPaths:
-    """The full set of per-session output file paths."""
+    """The full set of per-session output file paths.
+
+    The session writes into a local per-user temporary scratch folder
+    while it is running (``parent_session_folder`` and the
+    ``*_file_path`` fields nested under it). On graceful Stop, the
+    whole scratch folder is copied into the Videos Known Folder at
+    ``final_publication_parent_session_folder``. Two distinct paths
+    are tracked because the Videos Known Folder is frequently
+    redirected onto an SMB or OneDrive backing store that does not
+    reliably support the seek-back-and-overwrite I/O pattern that the
+    fragmented-MP4 muxer issues mid-stream; the scratch folder on the
+    local NTFS volume always does.
+
+    ``has_been_successfully_published_to_videos_library`` flips to True
+    once ``move_session_outputs_from_temporary_scratch_into_videos_library``
+    has finished copying every artifact into
+    ``final_publication_parent_session_folder``. Until then the live
+    on-disk artifacts only exist under ``parent_session_folder``.
+    """
 
     parent_session_folder: Path
+    final_publication_parent_session_folder: Path
     iso8601_session_id: str
     fragmented_mp4_video_file_path: Path
     session_metadata_json_file_path: Path
     display_configuration_json_file_path: Path
     per_frame_log_csv_file_path: Path
     text_log_file_path: Path
+    has_been_successfully_published_to_videos_library: bool = False
 
 
 def _build_iso8601_filesystem_safe_session_identifier(
@@ -1046,16 +1351,72 @@ def _build_iso8601_filesystem_safe_session_identifier(
     )
 
 
+def _resolve_per_user_temporary_directory_root_path() -> Path:
+    """Return the current user's per-user temporary directory as a ``Path``.
+
+    Delegates to ``tempfile.gettempdir()``, which on Microsoft Windows
+    consults the per-user ``TMP``, ``TEMP``, and ``USERPROFILE``
+    environment variables (in that order) and finally falls back to the
+    Windows directory. On a normally-installed Microsoft Windows
+    workstation this resolves to ``%LOCALAPPDATA%\\Temp\\`` for the
+    interactively-logged-in user, which is backed by the local NTFS
+    volume and is therefore safe for the seek-back-and-overwrite I/O
+    pattern issued mid-stream by the fragmented-MP4 muxer (unlike a
+    Videos Known Folder redirected onto an SMB share).
+    """
+    return Path(tempfile.gettempdir())
+
+
 def provision_fresh_per_session_output_folder(
+    *,
+    temporary_directory_root: Path,
     videos_known_folder_root: Path,
 ) -> PerSessionOutputFolderArtifactPaths:
-    """Create a fresh per-session output folder and return its artifact paths.
+    """Create a fresh per-session scratch folder and return both paths.
 
-    Creates ``<Videos>\\WindowsScreenRecorder\\<session-id>\\`` and verifies
-    it is writable. Raises ``OutputFolderProvisioningError`` if anything
-    goes wrong, with the full context of the attempted path and underlying
-    OS error.
+    Validates that *both* roots already exist on disk as directories and
+    refuses to proceed if either does not - the recorder will not
+    silently auto-create either root, because doing so is precisely
+    the kind of behavior corporate endpoint detection and response
+    tools flag as suspicious.
+
+    Creates the scratch session folder underneath the per-user
+    temporary directory at::
+
+        <Temp>\\WindowsScreenRecorder\\<session-id>\\
+
+    and verifies it is writable via a tiny round-trip probe file.
+
+    Computes (but does *not* create) the final publication folder
+    underneath the Videos Known Folder at the structurally identical
+    path::
+
+        <Videos>\\WindowsScreenRecorder\\<session-id>\\
+
+    The final folder (and any missing intermediates underneath the
+    Videos Known Folder) are created later, on Stop, by
+    ``move_session_outputs_from_temporary_scratch_into_videos_library``.
+
+    Raises ``OutputFolderProvisioningError`` if scratch provisioning
+    fails, or ``PerUserTemporaryDirectoryUnusableError`` /
+    ``VideosKnownFolderUnresolvableError`` -style validation failures
+    if either root is missing.
     """
+    if not temporary_directory_root.is_dir():
+        raise PerUserTemporaryDirectoryUnusableError(
+            f"The per-user temporary directory resolved by Python's "
+            f"tempfile.gettempdir() is not an existing directory on disk.\n"
+            f"  Resolved per-user temporary directory path : "
+            f"{temporary_directory_root}\n"
+            f"  Path.is_dir()                              : False\n"
+            f"On a normally-installed Microsoft Windows workstation this "
+            f"resolves to '%LOCALAPPDATA%\\Temp\\' for the interactively-"
+            f"logged-in user and always exists. Its absence indicates a "
+            f"corrupt user profile or a misconfigured TMP / TEMP "
+            f"environment variable. This program refuses to silently "
+            f"auto-create the per-user temporary directory."
+        )
+
     if not videos_known_folder_root.is_dir():
         raise OutputFolderProvisioningError(
             f"The Microsoft Windows Videos Known Folder resolved by "
@@ -1072,77 +1433,219 @@ def provision_fresh_per_session_output_folder(
             f"the Videos Known Folder via Group Policy) and retry."
         )
 
-    parent_folder = (
-        videos_known_folder_root
+    scratch_parent_folder = (
+        temporary_directory_root
         / OUTPUT_PARENT_SUBFOLDER_NAME_UNDER_VIDEOS_KNOWN_FOLDER
     )
     try:
-        parent_folder.mkdir(parents=False, exist_ok=True)
+        scratch_parent_folder.mkdir(parents=False, exist_ok=True)
     except OSError as mkdir_exc:
         raise OutputFolderProvisioningError(
-            f"Could not create the parent output subfolder underneath the "
-            f"Microsoft Windows Videos Known Folder.\n"
-            f"  Attempted parent folder    : {parent_folder}\n"
-            f"  Underlying OSError         : {mkdir_exc!r}\n"
-            f"Resolution: ensure the current user (running this program "
-            f"with elevated administrator privileges) has write permission "
-            f"to '{videos_known_folder_root}'."
+            f"Could not create the parent scratch subfolder underneath the "
+            f"per-user temporary directory.\n"
+            f"  Attempted parent scratch folder : {scratch_parent_folder}\n"
+            f"  Underlying OSError              : {mkdir_exc!r}\n"
+            f"Resolution: ensure the current user has write permission "
+            f"to '{temporary_directory_root}'."
         ) from mkdir_exc
 
     now_local = _datetime_module.datetime.now()
     session_identifier = _build_iso8601_filesystem_safe_session_identifier(
         now_local
     )
-    session_folder = parent_folder / session_identifier
+    scratch_session_folder = scratch_parent_folder / session_identifier
     try:
-        session_folder.mkdir(parents=False, exist_ok=False)
+        scratch_session_folder.mkdir(parents=False, exist_ok=False)
     except FileExistsError as already_exists_exc:
         raise OutputFolderProvisioningError(
-            f"The freshly-constructed ISO 8601 session folder path already "
-            f"exists, which is impossible because the session identifier "
-            f"includes microseconds.\n"
-            f"  Attempted session folder : {session_folder}\n"
+            f"The freshly-constructed ISO 8601 scratch session folder path "
+            f"already exists, which is impossible because the session "
+            f"identifier includes microseconds.\n"
+            f"  Attempted scratch session folder : "
+            f"{scratch_session_folder}\n"
             f"This indicates either a clock that runs backwards or a "
             f"corrupted filesystem. Aborting before any data is written."
         ) from already_exists_exc
     except OSError as mkdir_exc:
         raise OutputFolderProvisioningError(
-            f"Could not create the per-session output folder.\n"
-            f"  Attempted session folder : {session_folder}\n"
-            f"  Underlying OSError       : {mkdir_exc!r}"
+            f"Could not create the per-session scratch folder.\n"
+            f"  Attempted scratch session folder : "
+            f"{scratch_session_folder}\n"
+            f"  Underlying OSError               : {mkdir_exc!r}"
         ) from mkdir_exc
 
     # Smoke-test writability with a probe file we delete immediately.
-    probe_path = session_folder / ".writability_probe.tmp"
+    probe_path = scratch_session_folder / ".writability_probe.tmp"
     try:
         probe_path.write_bytes(b"")
         probe_path.unlink()
     except OSError as probe_exc:
         raise OutputFolderProvisioningError(
-            f"The per-session output folder was created but is not "
+            f"The per-session scratch folder was created but is not "
             f"writable.\n"
-            f"  Session folder      : {session_folder}\n"
-            f"  Underlying OSError  : {probe_exc!r}"
+            f"  Scratch session folder : {scratch_session_folder}\n"
+            f"  Underlying OSError     : {probe_exc!r}"
         ) from probe_exc
 
+    final_publication_session_folder = (
+        videos_known_folder_root
+        / OUTPUT_PARENT_SUBFOLDER_NAME_UNDER_VIDEOS_KNOWN_FOLDER
+        / session_identifier
+    )
+
     return PerSessionOutputFolderArtifactPaths(
-        parent_session_folder=session_folder,
+        parent_session_folder=scratch_session_folder,
+        final_publication_parent_session_folder=(
+            final_publication_session_folder
+        ),
         iso8601_session_id=session_identifier,
         fragmented_mp4_video_file_path=(
-            session_folder / PER_SESSION_VIDEO_FILE_NAME
+            scratch_session_folder / PER_SESSION_VIDEO_FILE_NAME
         ),
         session_metadata_json_file_path=(
-            session_folder / PER_SESSION_METADATA_JSON_FILE_NAME
+            scratch_session_folder / PER_SESSION_METADATA_JSON_FILE_NAME
         ),
         display_configuration_json_file_path=(
-            session_folder / PER_SESSION_DISPLAY_CONFIG_JSON_FILE_NAME
+            scratch_session_folder
+            / PER_SESSION_DISPLAY_CONFIG_JSON_FILE_NAME
         ),
         per_frame_log_csv_file_path=(
-            session_folder / PER_SESSION_PER_FRAME_LOG_CSV_FILE_NAME
+            scratch_session_folder
+            / PER_SESSION_PER_FRAME_LOG_CSV_FILE_NAME
         ),
         text_log_file_path=(
-            session_folder / PER_SESSION_TEXT_LOG_FILE_NAME
+            scratch_session_folder / PER_SESSION_TEXT_LOG_FILE_NAME
         ),
+    )
+
+
+def move_session_outputs_from_temporary_scratch_into_videos_library(
+    artifact_paths: PerSessionOutputFolderArtifactPaths,
+) -> PerSessionOutputFolderArtifactPaths:
+    """Move the per-session scratch folder into the Videos Known Folder.
+
+    Move semantics, not copy: peak on-disk usage never grows beyond
+    the size of the recording. Two paths exist:
+
+      * If the per-user temporary directory and the Videos Known
+        Folder reside on the *same* volume, a single ``os.rename``
+        atomically relocates the scratch session folder into the
+        Videos library. No double-storage transient, no chance of a
+        torn copy.
+
+      * If they reside on *different* volumes (the typical operator
+        setup: scratch on the local NTFS volume, Videos redirected
+        onto an SMB share or OneDrive backing store via Microsoft
+        Windows Folder Redirection), the cross-volume rename raises
+        ``OSError`` and this function falls back to
+        ``shutil.copytree`` + ``shutil.rmtree``. Peak storage is 2x
+        during the copy, dropping back to 1x as soon as the
+        cross-volume copy completes and the local scratch is removed.
+
+    Creates every missing intermediate directory underneath the Videos
+    Known Folder (the per-application ``WindowsScreenRecorder`` parent
+    subfolder may not exist yet on a first-ever run) before moving.
+
+    On any copy failure the scratch folder is preserved intact so the
+    operator can recover the recording manually. On copy success
+    followed by a scratch-cleanup failure the recording is already
+    safely at the publication target and the residual scratch is
+    abandoned for Microsoft Windows' Storage Sense to reclaim later
+    (raising here would falsely suggest the publication did not
+    succeed).
+
+    Returns a freshly-constructed ``PerSessionOutputFolderArtifactPaths``
+    with ``has_been_successfully_published_to_videos_library = True``
+    on success. Raises ``SessionPublicationToVideosLibraryError`` on
+    any I/O failure that prevented the recording from reaching the
+    publication target.
+
+    The caller must guarantee that every file handle into the scratch
+    folder has already been closed; an open handle on Microsoft Windows
+    would either deadlock the copy or produce a torn-line copy of the
+    log file.
+    """
+    scratch_source = artifact_paths.parent_session_folder
+    publication_destination = (
+        artifact_paths.final_publication_parent_session_folder
+    )
+
+    if not scratch_source.is_dir():
+        raise SessionPublicationToVideosLibraryError(
+            f"The per-session scratch source folder does not exist or is "
+            f"not a directory; nothing to publish.\n"
+            f"  Scratch source folder : {scratch_source}\n"
+            f"  Publication target    : {publication_destination}"
+        )
+
+    # Create every missing intermediate directory underneath the Videos
+    # Known Folder. The Videos Known Folder itself must already exist
+    # (validated by provision_fresh_per_session_output_folder), but
+    # the per-application subfolder may not.
+    publication_parent = publication_destination.parent
+    try:
+        publication_parent.mkdir(parents=True, exist_ok=True)
+    except OSError as parent_mkdir_exc:
+        raise SessionPublicationToVideosLibraryError(
+            f"Could not create the per-application publication parent "
+            f"subfolder underneath the Microsoft Windows Videos Known "
+            f"Folder.\n"
+            f"  Scratch source folder              : {scratch_source}\n"
+            f"  Attempted publication parent       : {publication_parent}\n"
+            f"  Underlying OSError                 : "
+            f"{parent_mkdir_exc!r}\n"
+            f"The session's recording remains intact at the scratch "
+            f"source folder above; the operator may copy it manually."
+        ) from parent_mkdir_exc
+
+    # Same-volume fast path: a single atomic os.rename relocates the
+    # entire scratch session folder into the Videos Known Folder
+    # without ever creating a second on-disk copy. On Microsoft
+    # Windows, os.rename across volumes (eg the typical operator
+    # setup of scratch on local C: vs Videos on a UNC SMB share)
+    # raises OSError with WinError 17 / errno EXDEV; we fall through
+    # to a copy-then-delete in that case.
+    try:
+        os.rename(str(scratch_source), str(publication_destination))
+    except OSError:
+        # Cross-volume move - copy first, then remove the scratch.
+        # shutil.copytree refuses to overwrite an existing destination,
+        # which is the behavior we want: the publication-target session
+        # folder name carries a microsecond-resolution timestamp, so a
+        # collision would mean a clock that ran backwards (or an
+        # attempt to re-publish a previously-published session, which
+        # we reject).
+        try:
+            shutil.copytree(
+                src=str(scratch_source),
+                dst=str(publication_destination),
+                copy_function=shutil.copy2,
+            )
+        except (OSError, shutil.Error) as copytree_exc:
+            raise SessionPublicationToVideosLibraryError(
+                f"Could not copy the per-session scratch folder into "
+                f"the Microsoft Windows Videos Known Folder.\n"
+                f"  Scratch source folder      : {scratch_source}\n"
+                f"  Publication target folder  : {publication_destination}\n"
+                f"  Underlying error           : "
+                f"{type(copytree_exc).__name__}: {copytree_exc}\n"
+                f"The session's recording remains intact at the "
+                f"scratch source folder above; the operator may copy "
+                f"it manually."
+            ) from copytree_exc
+
+        # Best-effort scratch cleanup. A failure here is non-fatal:
+        # the data is already safely at the publication target.
+        # Intentionally ignore errors - the per-user temporary
+        # directory's housekeeping (Microsoft Windows Storage Sense
+        # or manual Disk Cleanup) will reclaim any orphaned scratch
+        # folder later. Raising here would falsely suggest the
+        # publication did not succeed.
+        shutil.rmtree(str(scratch_source), ignore_errors=True)
+
+    return dataclasses.replace(
+        artifact_paths,
+        has_been_successfully_published_to_videos_library=True,
     )
 
 
@@ -2381,6 +2884,39 @@ class RecordingSessionController:
                 f"raised: {release_exc!r}"
             )
 
+        # Publish the scratch session folder into the Videos Known
+        # Folder. This is the second half of the scratch-then-publish
+        # pipeline: by deferring the network/SMB copy out of the
+        # encoder's hot path, we get a single sequential bulk-copy
+        # over SMB (which corporate folder-redirected NAS shares do
+        # support) instead of the fragmented-MP4 muxer's mid-stream
+        # seek-back-and-overwrite pattern (which they routinely do
+        # not). Must run *after* release_idempotently so every file
+        # handle into the scratch folder is closed.
+        if session.artifact_paths is not None:
+            try:
+                session.artifact_paths = (
+                    move_session_outputs_from_temporary_scratch_into_videos_library(
+                        session.artifact_paths
+                    )
+                )
+            except SessionPublicationToVideosLibraryError as publish_exc:
+                self._bootstrap_logger.error(
+                    "Publishing the per-session scratch folder to the "
+                    "Microsoft Windows Videos Known Folder failed; the "
+                    "recording remains intact at the scratch source "
+                    f"folder. Underlying exception: {publish_exc}"
+                )
+                # If the recording itself succeeded but publication
+                # failed, promote the publication failure to the
+                # consolidated fatal exception so the GUI surfaces it
+                # in the FATAL_ERROR_OBSERVED state (the operator
+                # otherwise has no way to learn that their recording
+                # is sitting in the scratch folder rather than the
+                # expected Videos Library location).
+                if consolidated_fatal_exception is None:
+                    consolidated_fatal_exception = publish_exc
+
         with self._state_lock:
             self._most_recently_completed_session_artifact_paths = (
                 session.artifact_paths
@@ -2434,8 +2970,12 @@ class RecordingSessionController:
         videos_folder = (
             _resolve_current_user_videos_known_folder_path()
         )
+        temporary_directory_root = (
+            _resolve_per_user_temporary_directory_root_path()
+        )
         session.artifact_paths = provision_fresh_per_session_output_folder(
-            videos_folder
+            temporary_directory_root=temporary_directory_root,
+            videos_known_folder_root=videos_folder,
         )
         session.session_started_at_local_datetime = (
             _datetime_module.datetime.now()
@@ -2823,18 +3363,33 @@ class RecordingSessionController:
                     if capture_w is not None
                     else 0.0
                 ),
+                # Output paths are recorded at the *publication* target
+                # (underneath the Videos Known Folder) rather than at
+                # the per-user temporary scratch location, because
+                # session.json is itself copied into the publication
+                # target on Stop, and an operator opening that JSON
+                # expects every path it references to resolve next to
+                # the JSON file. If publication fails the recording
+                # remains intact at the scratch source folder; the GUI
+                # surfaces that path separately.
                 "output_video_file_path": str(
-                    artifact_paths.fragmented_mp4_video_file_path
+                    artifact_paths.final_publication_parent_session_folder
+                    / PER_SESSION_VIDEO_FILE_NAME
                 ),
                 "output_per_frame_log_csv_file_path": str(
-                    artifact_paths.per_frame_log_csv_file_path
+                    artifact_paths.final_publication_parent_session_folder
+                    / PER_SESSION_PER_FRAME_LOG_CSV_FILE_NAME
                 ),
                 "output_display_configuration_json_file_path": str(
-                    artifact_paths
-                    .display_configuration_json_file_path
+                    artifact_paths.final_publication_parent_session_folder
+                    / PER_SESSION_DISPLAY_CONFIG_JSON_FILE_NAME
                 ),
                 "output_text_log_file_path": str(
-                    artifact_paths.text_log_file_path
+                    artifact_paths.final_publication_parent_session_folder
+                    / PER_SESSION_TEXT_LOG_FILE_NAME
+                ),
+                "temporary_scratch_session_folder_used_during_muxing": (
+                    str(artifact_paths.parent_session_folder)
                 ),
             }
             if consolidated_fatal_exception is not None:
@@ -2900,6 +3455,33 @@ class RecordingSessionController:
                     self._bootstrap_logger.error(
                         f"Partial-session release_idempotently raised: "
                         f"{release_exc!r}"
+                    )
+                # If folder provisioning *did* succeed before the
+                # partial failure, the scratch folder may contain a
+                # session.log with the failure traceback and a
+                # display_configuration.json with the host display
+                # state at the moment of failure. Publish those into
+                # the Videos Known Folder so the operator can review
+                # the forensic artifacts in the same location
+                # successful sessions land in.
+                if session.artifact_paths is not None:
+                    try:
+                        session.artifact_paths = (
+                            move_session_outputs_from_temporary_scratch_into_videos_library(
+                                session.artifact_paths
+                            )
+                        )
+                    except SessionPublicationToVideosLibraryError as publish_exc:
+                        self._bootstrap_logger.error(
+                            "Publishing the partial-session scratch "
+                            "folder to the Microsoft Windows Videos "
+                            "Known Folder failed; the partial recording "
+                            "and any forensic artifacts remain intact "
+                            "at the scratch source folder. Underlying "
+                            f"exception: {publish_exc}"
+                        )
+                    self._most_recently_completed_session_artifact_paths = (
+                        session.artifact_paths
                     )
                 self._active_session_resources = None
             self._latest_fatal_exception = fatal_exception
@@ -3088,6 +3670,65 @@ class _OperatorTkinterGui:
     def construct_and_run_blocking(self) -> None:
         self._tk_root = tk.Tk()
         self._tk_root.title(GUI_WINDOW_TITLE_TEXT)
+
+        # CRITICAL ORDERING: before *any* ttk widget is constructed
+        # and before *any* font measurement is taken, re-scale Tcl/Tk
+        # to the effective DPI of the Microsoft Windows monitor we
+        # intend to place this window onto (Display 2). This is the
+        # only way to make ``winfo_reqheight()`` and ttk widget
+        # metrics agree with the physical pixels Display 2 will draw,
+        # because Tcl/Tk's Windows backend captures screen DPI exactly
+        # once at ``Tk_Init`` time via ``GetDC(NULL); GetDeviceCaps``
+        # - and that desktop-DC value is, per Microsoft's own docs:
+        #     https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dpi-related-apis-and-registry-settings
+        # "the DPI of the primary display at the time the Windows
+        # session was started", regardless of which monitor a window
+        # ultimately lives on. Without this re-scaling step, a window
+        # destined for Display 2 is measured against Display 1's DPI
+        # and the layout is off by exactly the ratio of those two
+        # effective DPI values, which is precisely how the original
+        # symptom (the bottom button clipped off by ~half a button
+        # height) manifested on hosts whose two attached monitors are
+        # at different accessibility scale settings. The open Tcl/Tk
+        # ticket documenting this gap:
+        #     https://core.tcl-lang.org/tk/tktview?name=a9ee44102b
+        microsoft_windows_display_2 = (
+            self._initial_display_config
+            .microsoft_windows_display_2_secondary_for_operator_gui
+        )
+        microsoft_windows_display_2_center_x_pixel = (
+            microsoft_windows_display_2.bounding_rectangle_left
+            + microsoft_windows_display_2.bounding_rectangle_width // 2
+        )
+        microsoft_windows_display_2_center_y_pixel = (
+            microsoft_windows_display_2.bounding_rectangle_top
+            + microsoft_windows_display_2.bounding_rectangle_height // 2
+        )
+        (
+            display_2_effective_dpi_x,
+            display_2_effective_dpi_y,
+        ) = _query_effective_dpi_pixels_per_inch_of_monitor_containing_pixel(
+            virtual_screen_x_pixel=(
+                microsoft_windows_display_2_center_x_pixel
+            ),
+            virtual_screen_y_pixel=(
+                microsoft_windows_display_2_center_y_pixel
+            ),
+        )
+        # Tcl/Tk's ``tk scaling`` is a single scalar (pixels per
+        # point). Microsoft Windows allows the X and Y effective DPI
+        # values to differ on a per-monitor basis in theory, but the
+        # ``GetDeviceCaps(LOGPIXELSX/LOGPIXELSY)`` API has returned
+        # equal X and Y values on every shipping Microsoft Windows
+        # 10/11 build since at least 2015, and Microsoft's own UI
+        # framework treats them as the same. We drive Tk's scaling
+        # off the Y axis (it is what TkWinDisplayChanged samples).
+        _apply_target_monitor_effective_dpi_to_tkinter_root(
+            tk_root=self._tk_root,
+            target_monitor_effective_dpi_pixels_per_inch=(
+                display_2_effective_dpi_y
+            ),
+        )
 
         # Activate the modern ttk Microsoft Windows theme so labels,
         # buttons and separators get the standard Windows 10 / 11
@@ -3876,12 +4517,28 @@ class _OperatorTkinterGui:
         self._status_text_string_var.set(status_line)
 
         # Details line: output folder of the in-progress or most
-        # recently completed session.
+        # recently completed session. While the session is running (or
+        # if Stop-time publication into the Videos Known Folder failed)
+        # the artifacts still live in the per-user temporary scratch
+        # folder; we surface that path so the operator always knows
+        # exactly where their on-disk recording is. Only after a
+        # successful publication do we switch to displaying the final
+        # Videos-Library location.
         if artifact_paths is not None:
-            self._details_text_string_var.set(
-                "Session output folder:\n"
-                f"{artifact_paths.parent_session_folder}"
-            )
+            if (
+                artifact_paths
+                .has_been_successfully_published_to_videos_library
+            ):
+                self._details_text_string_var.set(
+                    "Session output folder:\n"
+                    f"{artifact_paths.final_publication_parent_session_folder}"
+                )
+            else:
+                self._details_text_string_var.set(
+                    "Session scratch folder (will copy to Videos "
+                    "library on Stop):\n"
+                    f"{artifact_paths.parent_session_folder}"
+                )
         else:
             self._details_text_string_var.set(
                 f"Videos Known Folder: {self._videos_known_folder_path}"
