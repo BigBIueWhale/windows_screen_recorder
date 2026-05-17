@@ -2510,10 +2510,72 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         2. ``output_packet.pts`` must be strictly greater than the
            previously muxed packet's ``pts``. We feed h264_qsv with
            strictly increasing input-frame PTS values, and a
-           B-frame-free encoder must emit packets in input order with
-           strictly increasing output PTS. A violation here would
-           signal either a libmfx bug we cannot work around or an
-           unexpected B-frame leaking into the GOP.
+           B-frame-free encoder must emit packets in input order
+           with strictly increasing output PTS.
+
+           This invariant is, strictly speaking, redundant - with
+           the ``pkt.dts := pkt.pts`` override applied just below,
+           FFmpeg's mp4 muxer already enforces the same constraint
+           one stack-frame down, at
+           ``libavformat/mux.c::compute_muxer_pkt_fields`` lines
+           410-420 of FFmpeg 8.0.1 (the exact FFmpeg release that
+           PyAV 17.0.1 statically links via the ``pyav-ffmpeg``
+           release tag ``8.0.1-5``). The relevant block, copied
+           verbatim from
+           https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/mux.c#L410-L420
+
+               if (sti->cur_dts && sti->cur_dts != AV_NOPTS_VALUE &&
+                   ((!(s->oformat->flags & AVFMT_TS_NONSTRICT) &&
+                     st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
+                     st->codecpar->codec_type != AVMEDIA_TYPE_DATA &&
+                     sti->cur_dts >= pkt->dts) || sti->cur_dts > pkt->dts)) {
+                   av_log(s, AV_LOG_ERROR,
+                          "Application provided invalid, non monotonically "
+                          "increasing dts to muxer in stream %d: %s >= %s\n",
+                          st->index, av_ts2str(sti->cur_dts),
+                          av_ts2str(pkt->dts));
+                   return AVERROR(EINVAL);
+               }
+
+           The mp4 muxer does NOT set ``AVFMT_TS_NONSTRICT``: see
+           ``ff_mp4_muxer.p.flags = AVFMT_GLOBALHEADER |
+           AVFMT_TS_NEGATIVE | AVFMT_VARIABLE_FPS`` at
+           ``libavformat/movenc.c`` line 8939 of FFmpeg 8.0.1
+           (https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/movenc.c#L8939).
+           So equality is rejected too - identical semantics to
+           the ``<=`` we apply here.
+
+           We assume nothing about that downstream check remaining
+           in place across future FFmpeg releases - it could be
+           weakened by an upstream patch, or PyAV 18 could repin
+           against an FFmpeg version that changes the contract -
+           and we assume nothing about whether the libmfx /
+           ``vpl-gpu-rt`` H.264 path might surface duplicate-PTS
+           packets again under some other AsyncDepth /
+           RateControlMethod combination. So we enforce the
+           invariant ourselves in Python, before the mux call,
+           for three concrete reasons:
+
+           (a) the failure surfaces earlier in the call chain -
+               the traceback points at the encoder worker rather
+               than at ``output_container.mux(output_packet)``;
+           (b) the Python-side error message carries diagnostic
+               context that the libav ``ArgumentError`` does not -
+               the raw pre-override DTS, the packet flags, the
+               running input-frame counter, and a pointer at the
+               specific ``qsvenc.c`` defect class that produces
+               this defect class;
+           (c) the program's correctness does not silently depend
+               on a libavformat invariant remaining in place;
+               asserting it locally turns "could not have
+               happened" into "would loudly fail if it ever did
+               happen".
+
+           This is defense in depth, not paranoia, and the
+           assumption ledger above is the entire justification.
+           A violation here would signal either a libmfx defect
+           this program cannot work around or an unexpected
+           B-frame leaking into the GOP.
         """
         # Snapshot the libmfx-derived packet metadata BEFORE the
         # ``pkt.dts := pkt.pts`` override and BEFORE any other
