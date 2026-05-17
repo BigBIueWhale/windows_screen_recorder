@@ -158,6 +158,7 @@ from __future__ import annotations
 # ----------------------------------------------------------------------------
 # Standard library imports
 # ----------------------------------------------------------------------------
+import collections
 import csv
 import ctypes
 import dataclasses
@@ -1974,7 +1975,48 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                 self.recording_start_monotonic_seconds
             )
             pause_started_monotonic: Optional[float] = None
-            next_presentation_timestamp_value = 0
+            # Variable-frame-rate (VFR) capture timestamping. Every
+            # captured BGRA frame's PTS is anchored to the real
+            # wall-clock instant of its python-mss BitBlt, expressed
+            # in output stream time-base units
+            # (``1 / TARGET_OUTPUT_FRAMES_PER_SECOND`` seconds per
+            # unit), and discounted by the cumulative wall-clock time
+            # the operator has held the recording paused. This is the
+            # only sound timestamping discipline for a Microsoft
+            # Windows screen recorder: the seven-layer capture-to-
+            # encode pipeline (python-mss GDI BitBlt -> NumPy copy
+            # -> inter-thread queue.put -> FFmpeg libswscale
+            # BGRA-to-NV12 conversion -> libavcodec encode call ->
+            # FFmpeg's ``h264_qsv`` wrapper -> Intel oneVPL runtime
+            # -> Intel Graphics driver -> Intel Quick Sync Video
+            # silicon block on the integrated Intel UHD Graphics 770
+            # GPU) is bounded by what the slowest layer can deliver
+            # in real time, NOT by a constant 30 Hz clock. A sequence-
+            # counter PTS scheme (PTS == frame-index N for the Nth
+            # successful capture) would silently speed up the output
+            # video whenever any layer of that pipeline lagged: N
+            # capture iterations achieved in T real seconds would
+            # surface as N output packets with PTS values 0..N-1 in a
+            # ``time_base = 1/TARGET_OUTPUT_FRAMES_PER_SECOND``
+            # stream, which the output player would render in
+            # ``N / TARGET_OUTPUT_FRAMES_PER_SECOND`` wall-clock
+            # seconds rather than the operator's actual T seconds of
+            # recording. Anchoring every PTS to its real-time capture
+            # instant produces an output whose playback duration
+            # always equals the operator's real-time recording
+            # duration, with any layer-induced lag visible in the
+            # output as a brief frozen-content interval rather than
+            # as a global playback speedup.
+            #
+            # The CFR pacing logic below stays in place to ENFORCE A
+            # MAXIMUM frame rate (we never produce more than one
+            # frame per ``1/TARGET_OUTPUT_FRAMES_PER_SECOND``
+            # wall-clock slot); the VFR PTS scheme below accepts
+            # whatever EFFECTIVE rate the capture loop achieves under
+            # that ceiling.
+            last_emitted_presentation_timestamp_in_stream_time_base_units: Optional[
+                int
+            ] = None
 
             while not self._stop_event.is_set():
                 # ----- Pause/resume bookkeeping -----
@@ -1982,8 +2024,9 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                     if pause_started_monotonic is None:
                         pause_started_monotonic = time.monotonic()
                         self._logger.info(
-                            "Capture worker observed pause request at PTS "
-                            f"{next_presentation_timestamp_value}."
+                            "Capture worker observed pause request at "
+                            "most-recent-emitted PTS "
+                            f"{last_emitted_presentation_timestamp_in_stream_time_base_units}."
                         )
                     # Use Event.wait, not time.sleep, so the worker wakes
                     # up the instant the operator presses Stop. The wait
@@ -2034,17 +2077,77 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 
                 # ----- Capture one BGRA frame -----
                 capture_start_monotonic = time.monotonic()
+                # Compute the spec-correct VFR PTS for this capture
+                # instant. ``elapsed_recording_seconds_since_session_start``
+                # is real wall-clock time since the capture loop began,
+                # minus accumulated pause durations; the recorder
+                # docstring at the top of the file declares that
+                # pauses are NOT advanced over in the encoded output,
+                # so a 5-second pause produces a seamless cut rather
+                # than 5 seconds of frozen content. Multiplying by
+                # ``TARGET_OUTPUT_FRAMES_PER_SECOND`` converts wall-
+                # clock seconds to stream time-base units (where the
+                # stream's ``time_base`` is
+                # ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``),
+                # and ``round`` snaps to the nearest 1/30-second
+                # output frame slot.
+                elapsed_recording_seconds_since_session_start = (
+                    capture_start_monotonic
+                    - self.recording_start_monotonic_seconds
+                    - self.total_paused_wall_clock_seconds
+                )
+                candidate_presentation_timestamp_in_stream_time_base_units = (
+                    round(
+                        elapsed_recording_seconds_since_session_start
+                        * TARGET_OUTPUT_FRAMES_PER_SECOND
+                    )
+                )
+                # Strict-monotonic guard: the encoder-side synthesis
+                # in
+                # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+                # requires every input frame's PTS to be strictly
+                # greater than the previously enqueued frame's PTS.
+                # If the candidate PTS would land in the same (or an
+                # earlier) 1/TARGET_OUTPUT_FRAMES_PER_SECOND wall-
+                # clock slot the previously emitted frame already
+                # occupies, this capture is silently dropped: the
+                # output already represents this slot, so emitting
+                # another frame for it would either duplicate content
+                # the player will not display (the player only shows
+                # one frame per PTS slot) or violate the encoder's
+                # strict-monotonic-PTS invariant. The CFR pacing
+                # logic above is the primary line of defence against
+                # this; the guard here is the secondary line that
+                # holds across clock anomalies (a monotonic-clock
+                # backward jump, a host wake-from-sleep, a Microsoft
+                # Windows kernel scheduler quantum that runs us twice
+                # in one slot).
+                if (
+                    last_emitted_presentation_timestamp_in_stream_time_base_units
+                    is not None
+                    and candidate_presentation_timestamp_in_stream_time_base_units
+                    <= last_emitted_presentation_timestamp_in_stream_time_base_units
+                ):
+                    self.frames_dropped_due_to_capture_lag_so_far += 1
+                    scheduled_next_capture_monotonic += (
+                        target_capture_interval_seconds
+                    )
+                    continue
+                current_capture_presentation_timestamp_in_stream_time_base_units = (
+                    candidate_presentation_timestamp_in_stream_time_base_units
+                )
+
                 try:
                     raw_screenshot = sct.grab(mss_monitor_capture_region)
                 except Exception as mss_grab_exc:
                     raise ScreenFrameCaptureFailureError(
                         f"python-mss .grab() raised "
                         f"{type(mss_grab_exc).__name__}: {mss_grab_exc}\n"
-                        f"  Frame index attempted (PTS) : "
-                        f"{next_presentation_timestamp_value}\n"
-                        f"  Capture region              : "
+                        f"  PTS attempted (stream time-base units) : "
+                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
+                        f"  Capture region                          : "
                         f"{mss_monitor_capture_region}\n"
-                        f"  Wall-clock monotonic        : "
+                        f"  Wall-clock monotonic                    : "
                         f"{capture_start_monotonic}\n"
                         f"This typically indicates the operator's "
                         f"Microsoft Windows session has lost its desktop "
@@ -2069,8 +2172,8 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                         f"{expected_frame_height_pixels}\n"
                         f"  Got        : "
                         f"{raw_screenshot.width}x{raw_screenshot.height}\n"
-                        f"  Frame index: "
-                        f"{next_presentation_timestamp_value}\n"
+                        f"  PTS        : "
+                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
                         f"Resolution: stop the recording, restore the "
                         f"original Microsoft Windows display configuration, "
                         f"and start a fresh recording."
@@ -2095,7 +2198,7 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                     self._queue.put(
                         _CapturedFrameForEncoder(
                             presentation_timestamp_in_one_frame_units=(
-                                next_presentation_timestamp_value
+                                current_capture_presentation_timestamp_in_stream_time_base_units
                             ),
                             bgra_frame_pixel_buffer=bgra_pixel_buffer,
                             monotonic_capture_instant_seconds=(
@@ -2111,9 +2214,9 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                         f"frames for more than 5 seconds. The Intel Quick "
                         f"Sync Video H.264 encoder cannot consume frames as "
                         f"fast as Display 1 is producing them.\n"
-                        f"  Frame index that failed to enqueue : "
-                        f"{next_presentation_timestamp_value}\n"
-                        f"  Target capture rate                : "
+                        f"  PTS that failed to enqueue : "
+                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
+                        f"  Target capture rate         : "
                         f"{TARGET_OUTPUT_FRAMES_PER_SECOND} fps\n"
                         f"This program does not silently drop frames in "
                         f"that condition. Resolution: reduce the captured "
@@ -2125,7 +2228,7 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
                 with self._csv_lock:
                     self._csv_writer.writerow(
                         [
-                            next_presentation_timestamp_value,
+                            current_capture_presentation_timestamp_in_stream_time_base_units,
                             f"{capture_start_monotonic:.6f}",
                             f"{self.total_paused_wall_clock_seconds:.6f}",
                         ]
@@ -2141,10 +2244,14 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 
                 self.frames_successfully_captured_so_far += 1
                 self.last_captured_frame_monotonic_seconds = capture_start_monotonic
-                next_presentation_timestamp_value += 1
+                last_emitted_presentation_timestamp_in_stream_time_base_units = (
+                    current_capture_presentation_timestamp_in_stream_time_base_units
+                )
                 # Advance the schedule baseline strictly by the target
-                # interval (not by the actual elapsed time): this is what
-                # gives us true CFR pacing rather than drift.
+                # interval (not by the actual elapsed time): this is
+                # what holds the schedule's "next slot" line on the
+                # original 1/TARGET_OUTPUT_FRAMES_PER_SECOND grid
+                # rather than drifting on cumulative jitter.
                 scheduled_next_capture_monotonic += (
                     target_capture_interval_seconds
                 )
@@ -2249,7 +2356,8 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 # layer that can observe it. We assume nothing about defaults at any
 # layer.
 #
-# Two things this configuration-locking strategy CANNOT cover:
+# Two things this configuration-locking strategy CANNOT cover, and
+# the structural defences this program puts in place against each:
 #
 #   (a) The Intel oneVPL runtime's H.264 hardware-encode
 #       implementation (the ``intel/vpl-gpu-rt`` project, layer 5)
@@ -2260,26 +2368,95 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 #       sanitisation, despite the sister file ``qsvdec.c`` lines
 #       64-70 sanitising the same sentinel correctly on the decoder
 #       side. This is an Intel bug compounded by an FFmpeg bug;
-#       neither has been fixed at the time of writing. The encoder
-#       worker therefore SYNTHESIZES every output packet's ``pts``
-#       and ``dts`` from a strictly-monotonic per-packet counter
-#       in ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
-#       below, ignoring the libmfx-derived values entirely. The
-#       synthesized values are spec-correct under invariant (i) of
-#       the encoder worker class docstring.
+#       neither has been fixed at the time of writing.
+#
+#       Structural defence: the encoder worker does not trust the
+#       libmfx-derived ``pkt.pts`` / ``pkt.dts`` for any output
+#       packet. The capture worker writes a wall-clock-anchored,
+#       strictly-monotonic PTS into every input frame's
+#       ``av.VideoFrame.pts`` (variable-frame-rate timestamping
+#       discipline); the encoder worker threads each such PTS
+#       through a FIFO at submission and ``popleft``s the matching
+#       value at mux time, overwriting whatever Intel's runtime
+#       wrote into ``mfxBitstream.TimeStamp``. Under the
+#       no-B-frames configuration of invariant (i), the FIFO
+#       ``popleft`` is the H.264-spec-correct PTS for the
+#       corresponding output packet. The first libmfx-vs-FIFO
+#       disagreement emits a verbose ``WARNING`` to
+#       ``session.log``; subsequent disagreements are rate-limited
+#       to one ``WARNING`` per
+#       ``_INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS``
+#       packets so the log stays bounded across multi-hour
+#       long-form recordings even when the disagreement fires on
+#       every output packet.
 #
 #   (b) The Intel oneVPL runtime might theoretically also drop or
-#       duplicate output packets (i.e. break the 1:1
-#       input-frame-to-output-bitstream correspondence that
-#       ``GopRefDist=1`` is supposed to guarantee). The synthesis in
-#       (a) RELIES on that 1:1 correspondence to map the Nth output
-#       packet to input-frame-index N. If the runtime were to break
-#       it too, the synthesized PTS values would be correct integers
-#       but would label the wrong content - the resulting MP4 would
-#       play back with a one-frame displacement somewhere. We have
-#       no defence against this from inside the encoder worker
-#       without parsing the H.264 bitstream and cross-referencing
-#       frame counts; we choose not to.
+#       duplicate output packets (i.e. break the 1:1 input-frame-
+#       to-output-bitstream correspondence that ``GopRefDist=1`` is
+#       supposed to guarantee). The synthesis in (a) RELIES on that
+#       1:1 correspondence to map the Nth output packet to the
+#       PTS the capture worker assigned to the Nth input frame.
+#
+#       Structural defence (end-of-session): the encoder worker
+#       verifies the pending-input-frame-PTS FIFO is empty
+#       immediately after the graceful libavcodec flush
+#       (``output_stream.encode(None)``). A non-empty FIFO at
+#       that point proves that the encoder produced fewer output
+#       packets than this program submitted input frames, and the
+#       worker raises ``EncoderPipelineError`` rather than closing
+#       a silently truncated output MP4.
+#
+#       Structural defence (mid-stream): the FIFO ``popleft`` at
+#       every mux call also covers the dual case where the runtime
+#       produces MORE output packets than input frames. The
+#       second ``popleft`` from an empty FIFO raises
+#       ``EncoderPipelineError`` at the exact output packet that
+#       has no submitted input to pair with, rather than allowing
+#       a spurious packet to reach the mp4 muxer.
+#
+#       What this program CANNOT detect mid-stream: a runtime that
+#       drops AND duplicates an equal number of packets across the
+#       session, preserving total count but desynchronising
+#       content-to-PTS correspondence somewhere inside the stream.
+#       Detecting that would require parsing the H.264 bitstream
+#       from inside the encoder worker; this program does not.
+#
+# Long-form recording stability properties of the design described
+# above (the recorder is intended to be left running for hours-long
+# sessions):
+#
+#   * Bounded memory. The capture-to-encoder ``queue.Queue`` is
+#     bounded at ``CAPTURE_TO_ENCODER_QUEUE_MAXIMUM_DEPTH_FRAMES``
+#     frames; the pending-input-frame-PTS FIFO size is bounded by
+#     the encoder's internal pipeline depth (~``async_depth``
+#     entries at steady state, plus a small variable transient at
+#     pipeline fill). Neither grows with session length.
+#
+#   * Bounded log volume. Per-packet ``DEBUG`` lines accumulate at
+#     a fixed rate proportional to the encoder output rate. The
+#     ``WARNING`` lines associated with the Intel oneVPL runtime
+#     ``mfxBitstream.TimeStamp`` defect are explicitly rate-
+#     limited (see (a) above). Total ``session.log`` size grows
+#     linearly with session length at a small constant factor.
+#
+#   * No floating-point drift in PTS arithmetic. The capture
+#     worker's VFR PTS computation casts to int via ``round``
+#     immediately, so subsequent computation is integer-only and
+#     immune to cumulative ``+=`` floating-point error. Python
+#     integers are unbounded, and the ``int64_t`` field
+#     libavcodec uses internally for PTS holds well over a billion
+#     years of 30 fps recording before overflow.
+#
+#   * No CFR-schedule drift at long horizons. The capture worker
+#     resets its CFR baseline if it ever falls more than one
+#     full second behind schedule, capping the worst-case drift
+#     accumulation at one second regardless of how long the
+#     session runs.
+#
+#   * No PTS-counter coupling between capture and encoder. The
+#     FIFO carries the capture worker's PTS values verbatim to the
+#     mux helper; there is no integer counter on the encoder side
+#     that could drift relative to the capture-side wall clock.
 
 
 def _format_encoder_pipeline_error_message_from_ffmpeg_error(
@@ -2390,28 +2567,43 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
          decode order == display order == input order.
 
     (ii) Each output packet's ``pts`` and ``dts`` are SYNTHESIZED
-         from a strictly-monotonic per-packet counter inside
+         from the strictly-monotonic FIFO of input-frame PTS
+         values
+         (``_pending_input_frame_pts_fifo_in_stream_time_base_units``),
+         inside
          ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``,
-         and the libmfx-derived ``mfxBitstream.TimeStamp`` and
+         and the libmfx-derived ``mfxBitstream.TimeStamp`` /
          ``mfxBitstream.DecodeTimeStamp`` values that FFmpeg's
          ``h264_qsv`` wrapper writes onto ``av.Packet`` are
-         discarded. This program does not get to trust those
-         libmfx-derived values, because Intel's ``vpl-gpu-rt``
-         H.264 hardware-encode implementation silently fails to
-         populate ``mfxBitstream.TimeStamp`` on a non-deterministic
-         subset of its output packets - and FFmpeg's
+         discarded. The capture worker writes a real-wall-clock-
+         anchored, strictly-monotonic-but-not-necessarily-sequential
+         PTS into every input frame's ``av.VideoFrame.pts`` (the
+         variable-frame-rate timestamping discipline; see the
+         capture worker's docstring), and this encoder worker
+         threads each such PTS through the FIFO so the Nth
+         ``popleft`` at the mux helper returns the PTS that
+         belongs to the Nth output packet under invariant (i).
+         This program does not trust the libmfx-derived values
+         because Intel's ``vpl-gpu-rt`` H.264 hardware-encode
+         implementation silently fails to populate
+         ``mfxBitstream.TimeStamp`` on a non-deterministic subset
+         of its output packets - and FFmpeg's
          ``libavcodec/qsvenc.c`` line 2667 maps the resulting
          sentinel / zero straight through to ``pkt.pts = 0`` with
-         no sanitisation. The synthesized counter value is the
-         H.264-spec-correct ``pts`` and ``dts`` for the Nth output
-         packet under invariant (i): the long-form derivation is in
-         the docstring of
-         ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``.
-         Every disagreement between the libmfx-derived value and
-         the synthesized value is logged at WARNING into
-         ``session.log`` so the magnitude and frequency of the
-         Intel oneVPL runtime's ``mfxBitstream.TimeStamp`` defect
-         on the running hardware remains forensically observable.
+         no sanitisation. The first observed disagreement between
+         the libmfx-derived ``pkt.pts`` and the FIFO-derived
+         synthesized value emits a ``WARNING`` with full context;
+         subsequent disagreements are rate-limited to one
+         ``WARNING`` per
+         ``_INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS``
+         packets (bounded ``session.log`` growth across multi-hour
+         long-form recordings), with the per-packet trail
+         preserved at ``DEBUG`` and the final total reported once
+         at ``INFO`` on encoder-worker exit and persisted into the
+         session metadata JSON. A non-empty FIFO at graceful
+         flush time is treated as a 1:1-correspondence violation
+         on Intel's side and surfaces as an ``EncoderPipelineError``
+         rather than silently truncating the output MP4.
 
     The worker honours two distinct stop signals:
 
@@ -2440,6 +2632,19 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
     # so that it can wake up promptly to observe a force-cancel.
     _QUEUE_GET_POLL_TIMEOUT_SECONDS: Final[float] = 0.10
 
+    # Period (in output packets) at which the encoder worker emits a
+    # rate-limited ``WARNING`` line summarising ongoing Intel oneVPL
+    # runtime ``mfxBitstream.TimeStamp`` disagreements. On a hardware
+    # / driver pair where the disagreement fires on every packet from
+    # the 6th onward, an unbounded ``WARNING`` per packet would
+    # accumulate hundreds of megabytes of ``session.log`` over a
+    # multi-hour long-form recording. With ``LOG_PERIOD_PACKETS =
+    # 1800``, the ``WARNING`` count is bounded to (one log line per
+    # minute of recording at the target 30 fps frame rate) plus the
+    # always-emitted first-occurrence ``WARNING`` and the always-
+    # emitted final summary at session exit.
+    _INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS: Final[int] = 1800
+
     def __init__(
         self,
         output_video_file_path: Path,
@@ -2462,26 +2667,64 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
 
         self.fatal_exception: Optional[BaseException] = None
         self.frames_successfully_encoded_so_far: int = 0
+        self.output_packets_successfully_muxed_so_far: int = 0
         self.frames_discarded_due_to_force_cancel_so_far: int = 0
         self.encoder_was_force_cancelled: bool = False
 
-        # Strictly-monotonic counter from which the encoder worker
-        # synthesizes every output ``av.Packet``'s ``pts`` and ``dts``
-        # in stream time-base units, in
-        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``.
-        # Starts at 0 and increments by exactly 1 per muxed packet.
-        # This program deliberately does NOT trust the ``pkt.pts`` and
-        # ``pkt.dts`` values that surface out of FFmpeg's ``h264_qsv``
-        # encoder wrapper, because Intel's ``vpl-gpu-rt`` H.264
-        # hardware-encode implementation (the Intel-shipped
-        # implementation of the Intel oneVPL runtime, distributed with
-        # the Intel Graphics driver) silently fails to populate
-        # ``mfxBitstream.TimeStamp`` on a non-deterministic subset of
-        # its output packets. See the long-form rationale on the
+        # Disagreement counter for the libmfx-derived ``pkt.pts`` vs.
+        # this program's synthesized PTS. Bumped once per output packet
+        # on which the two disagree. We log a single ``WARNING`` on
+        # the very first disagreement (full context); thereafter only
+        # one ``WARNING`` per
+        # ``_INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS``
+        # packets (a short tally line). The complete forensic trail
+        # is preserved at ``DEBUG`` level on every packet regardless.
+        # This rate-limiting keeps the per-session ``session.log``
+        # bounded for long-form recordings on a host whose Intel
+        # oneVPL runtime persistently emits broken
+        # ``mfxBitstream.TimeStamp`` values.
+        self.total_intel_onevpl_pts_disagreements_observed: int = 0
+
+        # First-in-first-out queue of input-frame PTS values (in
+        # stream time-base units) that have been submitted to FFmpeg's
+        # ``h264_qsv`` wrapper via ``output_stream.encode(...)`` but
+        # whose corresponding output packet has not yet been muxed.
+        # The capture worker writes a strictly-monotonic-but-not-
+        # necessarily-sequential PTS into every
+        # ``_CapturedFrameForEncoder.presentation_timestamp_in_one_frame_units``
+        # value it enqueues (see the long-form VFR rationale in the
+        # capture worker's ``_run_capture_loop``); the encoder worker
+        # threads each such value into this FIFO at the moment of
+        # ``output_stream.encode`` submission, and the mux helper
         # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
-        # method below for why the synthesized values are
-        # spec-correct under this program's encoder configuration.
-        self._next_synthesized_output_packet_pts_in_stream_time_base_units: int = 0
+        # ``popleft``s the matching value at the moment a libavcodec
+        # output packet emerges - assigning it as the synthesized
+        # ``pkt.pts`` and ``pkt.dts``, in place of the broken values
+        # Intel's ``vpl-gpu-rt`` H.264 implementation writes into
+        # ``mfxBitstream.TimeStamp`` and ``mfxBitstream.DecodeTimeStamp``.
+        # The FIFO is correct because under invariant (i) of this
+        # class's docstring (``INTEL_QSV_MAX_B_FRAMES_VALUE = 0``,
+        # validated post-open), FFmpeg's ``h264_qsv`` wrapper emits
+        # exactly one output packet per input frame in input order;
+        # the Nth ``popleft`` therefore yields the PTS of the input
+        # frame that the Nth output packet was encoded from.
+        self._pending_input_frame_pts_fifo_in_stream_time_base_units: "collections.deque[int]" = (
+            collections.deque()
+        )
+        # Monotonicity ledger for the synthesized output PTS. Tracks
+        # the most-recently-muxed packet's synthesized PTS so the mux
+        # helper can verify - defensively, on every packet - that the
+        # FIFO is yielding strictly-increasing values. By
+        # construction the FIFO only ever contains strictly-
+        # increasing values (the capture worker enforces that
+        # invariant at its enqueue site), so this check is a tautology
+        # in the absence of bugs. It is here to make any future bug
+        # that breaks that invariant fail loudly at the exact mux
+        # call that observes it, rather than silently producing an
+        # out-of-order ``av_interleaved_write_frame`` call.
+        self._last_muxed_synthesized_output_packet_pts_in_stream_time_base_units: Optional[
+            int
+        ] = None
 
     def run(self) -> None:
         try:
@@ -2674,6 +2917,18 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                         .presentation_timestamp_in_one_frame_units
                     )
                     av_nv12_video_frame.time_base = output_stream.time_base
+                    # Record this input frame's PTS in the FIFO BEFORE
+                    # calling ``output_stream.encode`` - so that even if
+                    # ``encode`` immediately returns an output packet
+                    # (after the async-depth pipeline is full), the mux
+                    # helper finds the matching PTS at the head of the
+                    # FIFO. The FIFO order mirrors input-frame submission
+                    # order, which under the no-B-frame invariant equals
+                    # output-packet emission order.
+                    self._pending_input_frame_pts_fifo_in_stream_time_base_units.append(
+                        captured_frame
+                        .presentation_timestamp_in_one_frame_units
+                    )
                     for output_packet in output_stream.encode(
                         av_nv12_video_frame
                     ):
@@ -2760,6 +3015,55 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                         f"{type(non_ffmpeg_flush_exc).__name__}: "
                         f"{non_ffmpeg_flush_exc}"
                     ) from non_ffmpeg_flush_exc
+
+                # Invariant check after a graceful libavcodec flush:
+                # every input frame this program submitted to
+                # ``output_stream.encode(...)`` must, under the
+                # no-B-frames configuration locked in by
+                # ``INTEL_QSV_MAX_B_FRAMES_VALUE = 0``, have produced
+                # exactly one output packet on the way back up. The
+                # ``encode(None)`` call drains the entire Intel oneVPL
+                # async pipeline. The FIFO that pairs input PTSes
+                # with output packets therefore MUST be empty at this
+                # point. A non-empty FIFO here means Intel's
+                # ``vpl-gpu-rt`` H.264 implementation silently dropped
+                # ``len(FIFO)`` input frames somewhere in its
+                # pipeline - a 1:1 correspondence breakage that this
+                # program cannot otherwise detect, and that would
+                # produce an output MP4 whose every-frame contents
+                # are displaced by one frame relative to the
+                # operator's real-time screen activity (because every
+                # post-drop output packet would be assigned the PTS
+                # that originally belonged to the dropped frame).
+                if self._pending_input_frame_pts_fifo_in_stream_time_base_units:
+                    leftover_pts_values_after_graceful_flush = list(
+                        self._pending_input_frame_pts_fifo_in_stream_time_base_units
+                    )
+                    raise EncoderPipelineError(
+                        f"After the graceful libavcodec flush "
+                        f"(``output_stream.encode(None)`` returned no "
+                        f"further packets), the pending-input-frame-"
+                        f"PTS FIFO is not empty - the Intel oneVPL "
+                        f"runtime emitted fewer output packets than "
+                        f"this program submitted input frames. Under "
+                        f"the no-B-frames configuration this program "
+                        f"locks in (see ``INTEL_QSV_MAX_B_FRAMES_VALUE`` "
+                        f"in Section 2 and the post-open validator "
+                        f"that confirms it), input-to-output "
+                        f"correspondence is contractually 1:1. A "
+                        f"non-empty FIFO at flush time means Intel's "
+                        f"``vpl-gpu-rt`` H.264 implementation silently "
+                        f"dropped frames in its hardware-encode "
+                        f"pipeline.\n"
+                        f"  Total input frames submitted to encode() : "
+                        f"{self.frames_successfully_encoded_so_far}\n"
+                        f"  Total output packets muxed                : "
+                        f"{self.output_packets_successfully_muxed_so_far}\n"
+                        f"  Unmatched input PTS values remaining      : "
+                        f"{len(leftover_pts_values_after_graceful_flush)}\n"
+                        f"  First few unmatched PTS values            : "
+                        f"{leftover_pts_values_after_graceful_flush[:10]}"
+                    )
         finally:
             try:
                 output_container.close()
@@ -2771,11 +3075,17 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 )
 
         self._logger.info(
-            f"Encoder worker exiting normally. Total frames encoded: "
-            f"{self.frames_successfully_encoded_so_far}. Frames discarded "
-            f"by force-cancel: "
+            f"Encoder worker exiting normally. "
+            f"Total input frames submitted to encode() : "
+            f"{self.frames_successfully_encoded_so_far}. "
+            f"Total output packets muxed                : "
+            f"{self.output_packets_successfully_muxed_so_far}. "
+            f"Frames discarded by force-cancel          : "
             f"{self.frames_discarded_due_to_force_cancel_so_far}. "
-            f"Force-cancelled: {self.encoder_was_force_cancelled}."
+            f"Intel oneVPL runtime PTS disagreements    : "
+            f"{self.total_intel_onevpl_pts_disagreements_observed}. "
+            f"Force-cancelled                           : "
+            f"{self.encoder_was_force_cancelled}."
         )
 
     def _mux_one_encoded_packet_with_synthesized_pts_and_dts(
@@ -2848,11 +3158,15 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         It discards ``output_packet.pts`` and ``output_packet.dts``
         entirely - the values Intel's runtime put there via
         ``mfxBitstream.TimeStamp`` and ``mfxBitstream.DecodeTimeStamp``
-        - and substitutes a strictly-monotonic integer counter
-        (``_next_synthesized_output_packet_pts_in_stream_time_base_units``,
-        initialised to 0 in ``__init__``, incremented by exactly 1
-        per muxed packet). The substituted value is then assigned
-        to both ``output_packet.pts`` and ``output_packet.dts``.
+        - and substitutes the head of the strictly-monotonic FIFO
+        of input-frame PTS values
+        (``_pending_input_frame_pts_fifo_in_stream_time_base_units``,
+        ``popleft``ed once per output packet). The capture worker
+        ``append``s the wall-clock-anchored VFR PTS of every input
+        frame to this FIFO at submission; this method pops it back
+        out at the matching output packet. The popped value is then
+        assigned to both ``output_packet.pts`` and
+        ``output_packet.dts``.
 
         The substituted value is the *spec-correct* PTS and DTS
         for this program's encoder configuration. The chain of
@@ -2880,59 +3194,79 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
              corresponds to the Nth input frame this program fed
              into ``output_stream.encode``.
 
-          3. The capture worker submits input frames carrying
-             strictly-monotonic integer ``av.VideoFrame.pts``
-             values 0, 1, 2, ... in the stream time-base, via
-             ``av_nv12_video_frame.pts = N`` in ``_run_encode_loop``
-             above. The Nth input frame therefore has
-             ``av.VideoFrame.pts == N``.
+          3. The capture worker writes each input frame's
+             ``av.VideoFrame.pts`` to the real wall-clock instant
+             of its python-mss BitBlt, expressed in stream time-base
+             units (variable-frame-rate timestamping; see the
+             long-form rationale in the capture worker's
+             ``_run_capture_loop``). The PTS sequence is therefore
+             strictly monotonic but not necessarily sequential -
+             gaps appear in the PTS sequence at wall-clock instants
+             where the seven-layer capture-to-encode pipeline could
+             not deliver a frame within one
+             ``1 / TARGET_OUTPUT_FRAMES_PER_SECOND`` slot.
 
-          4. Combining (2) and (3): the Nth output packet's
-             spec-correct ``pkt.pts`` is N. A counter that starts
-             at 0 and increments by exactly 1 per output packet
-             produces exactly that value.
+          4. Combining (2) and (3): the Nth output packet is
+             encoded from the Nth input frame, so its spec-correct
+             ``pkt.pts`` is the same integer that the capture
+             worker wrote into the Nth input frame's
+             ``av.VideoFrame.pts``. The encoder worker carries
+             that integer forward via the FIFO field
+             ``_pending_input_frame_pts_fifo_in_stream_time_base_units``,
+             which the ``_run_encode_loop`` ``append``s to at the
+             moment of ``output_stream.encode(...)`` submission;
+             this method ``popleft``s from it at the moment a
+             libavcodec output packet emerges.
 
           5. With no B-frames, the H.264 specification mandates
              ``DTS == PTS`` for every packet (no out-of-order
-             reference frame ever has to be waited on). So the
-             same counter value is the spec-correct ``pkt.dts``.
+             reference frame ever has to be waited on). The
+             ``popleft``ed FIFO value is therefore the spec-correct
+             ``pkt.dts`` as well.
 
         That is the entire justification. There is no heuristic,
         no fudge, no "good enough"; under the four numbered
         invariants above the synthesized value is uniquely correct.
 
-        The hopeful step in this chain is link (2)'s
-        ``"the Nth output packet corresponds to the Nth input
-        frame"`` premise. We rely on it. It is what the H.264
-        ``GopRefDist=1`` configuration guarantees - in the spec.
-        We have to hope Intel's ``vpl-gpu-rt`` runtime, which has
-        already proven it does not honour the
-        ``mfxBitstream.TimeStamp`` contract, does at least honour
-        the ``one input frame produces exactly one output
-        bitstream`` contract on top of which (2) rests. If the
-        runtime were to silently drop or duplicate an output
-        bitstream - say, the encoder internally short-circuiting
-        a low-delta frame and not emitting any packet for it -
-        the counter on the Nth output would no longer name the
-        Nth input frame, and the resulting MP4 would play back
-        with content displaced by one frame from where it should
-        be, with no diagnostic to surface that. We cannot detect
-        this from inside the encoder worker without parsing the
-        H.264 bitstream and cross-referencing frame counts; we
-        do not.
+        The hopeful step in this chain is link (2)'s ``"the Nth
+        output packet corresponds to the Nth input frame"`` premise.
+        We rely on it. It is what the H.264 ``GopRefDist=1``
+        configuration guarantees - in the spec. We have to hope
+        Intel's ``vpl-gpu-rt`` runtime, which has already proven it
+        does not honour the ``mfxBitstream.TimeStamp`` contract,
+        does at least honour the ``one input frame produces
+        exactly one output bitstream`` contract on top of which
+        (2) rests. If the runtime were to silently drop an output
+        bitstream mid-recording, the FIFO's Nth ``popleft`` would
+        return the PTS that originally belonged to the dropped
+        frame, and every subsequent output packet would carry a
+        PTS belonging to an earlier real-time moment than its
+        bitstream actually encodes - the resulting MP4 would play
+        back with content displaced by one frame's worth of
+        real-time. We cannot detect this from inside the encoder
+        worker without parsing the H.264 bitstream and cross-
+        referencing frame counts; we do not. We do however detect
+        the end-of-session symptom: a non-empty FIFO after the
+        graceful ``encode(None)`` flush means the encoder produced
+        fewer output packets than this program submitted input
+        frames, and ``_run_encode_loop`` raises
+        ``EncoderPipelineError`` rather than closing a silently
+        truncated output file.
 
-        Diagnostic counterpart: every packet's libmfx-derived
-        ``pkt.pts`` and ``pkt.dts`` are logged at DEBUG level into
-        the per-session ``session.log`` alongside the synthesized
-        values, so the magnitude and frequency of Intel's
-        ``mfxBitstream.TimeStamp`` defect on the running hardware
-        is forensically observable. Every disagreement between
-        the libmfx-derived ``pkt.pts`` and the synthesized value
-        also emits a WARNING-level line - a future reader scanning
-        ``session.log`` for ``WARNING`` will see exactly how
-        broken Intel's H.264 path is on this driver / hardware /
-        configuration combination, and exactly which packet
-        indices are affected.
+        Diagnostic counterpart: every output packet's libmfx-
+        derived ``pkt.pts`` / ``pkt.dts`` and the synthesized
+        ``popleft``ed PTS are logged at DEBUG into the per-session
+        ``session.log``. The first observed disagreement between
+        the libmfx-derived and the synthesized value emits a
+        ``WARNING`` line with full context. Subsequent
+        disagreements are rate-limited to one ``WARNING`` per
+        ``_INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS``
+        output packets so that a host whose Intel oneVPL runtime
+        disagrees on every packet does not balloon ``session.log``
+        across a multi-hour long-form recording. The full count of
+        disagreements observed during the session is logged once
+        at INFO at encoder-worker exit, and is also recorded in
+        the session metadata JSON.
         """
         # Snapshot the values the Intel oneVPL runtime / FFmpeg's
         # ``h264_qsv`` wrapper actually wrote into the packet,
@@ -2945,9 +3279,81 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         libmfx_derived_packet_dts_in_stream_time_base_units = (
             output_packet.dts
         )
+
+        # ``popleft`` the PTS of the input frame this output packet
+        # was encoded from. An empty FIFO at this point is an
+        # unrecoverable contract violation: FFmpeg's ``h264_qsv``
+        # wrapper produced an output packet without a corresponding
+        # input frame having been submitted, which under the
+        # no-B-frames configuration would mean the Intel oneVPL
+        # runtime synthesised a frame on its own.
+        if not self._pending_input_frame_pts_fifo_in_stream_time_base_units:
+            raise EncoderPipelineError(
+                f"FFmpeg's ``h264_qsv`` H.264 encoder wrapper "
+                f"emitted an output packet, but the pending-input-"
+                f"frame-PTS FIFO is empty. Under the no-B-frames "
+                f"configuration this program locks in (see the "
+                f"``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant and the "
+                f"post-open validator that confirms it),"
+                f" input-to-output correspondence is contractually "
+                f"1:1 and the FIFO must always carry the PTS of "
+                f"the input frame the current output packet was "
+                f"encoded from. An empty FIFO at this point means "
+                f"the Intel oneVPL runtime produced more output "
+                f"bitstreams than this program submitted input "
+                f"frames - the runtime either fabricated a frame or "
+                f"emitted a duplicate of an earlier one.\n"
+                f"  Total input frames submitted so far : "
+                f"{self.frames_successfully_encoded_so_far}\n"
+                f"  Total output packets muxed so far    : "
+                f"{self.output_packets_successfully_muxed_so_far}\n"
+                f"  libmfx-derived pkt.pts on the "
+                f"orphan packet                         : "
+                f"{libmfx_derived_packet_pts_in_stream_time_base_units}\n"
+                f"  libmfx-derived pkt.dts on the "
+                f"orphan packet                         : "
+                f"{libmfx_derived_packet_dts_in_stream_time_base_units}\n"
+                f"  packet.size_bytes                    : "
+                f"{output_packet.size}\n"
+                f"  packet.is_keyframe                   : "
+                f"{output_packet.is_keyframe}"
+            )
         synthesized_pts_and_dts_in_stream_time_base_units = (
-            self._next_synthesized_output_packet_pts_in_stream_time_base_units
+            self._pending_input_frame_pts_fifo_in_stream_time_base_units.popleft()
         )
+
+        # Defensive monotonicity ledger. By construction the FIFO
+        # only ever contains strictly-increasing values - the
+        # capture worker's VFR-PTS strict-monotonic guard enforces
+        # that at the enqueue site - so this branch can only be
+        # reached if a bug elsewhere violates the invariant. We
+        # surface the violation immediately rather than letting a
+        # silently-out-of-order ``av_interleaved_write_frame`` call
+        # the mp4 muxer reject one stack frame later.
+        if (
+            self._last_muxed_synthesized_output_packet_pts_in_stream_time_base_units
+            is not None
+            and synthesized_pts_and_dts_in_stream_time_base_units
+            <= self._last_muxed_synthesized_output_packet_pts_in_stream_time_base_units
+        ):
+            raise EncoderPipelineError(
+                f"The pending-input-frame-PTS FIFO ``popleft``ed a "
+                f"value that is not strictly greater than the "
+                f"previously muxed packet's synthesized PTS. This "
+                f"is an internal-invariant violation: the FIFO is "
+                f"appended-to only by the capture worker, which "
+                f"enforces strict monotonicity on its VFR PTS "
+                f"computation, so this branch should be "
+                f"unreachable in correct operation.\n"
+                f"  Previously muxed synthesized PTS : "
+                f"{self._last_muxed_synthesized_output_packet_pts_in_stream_time_base_units}\n"
+                f"  Just-popped FIFO PTS              : "
+                f"{synthesized_pts_and_dts_in_stream_time_base_units}\n"
+                f"  Output packets muxed so far        : "
+                f"{self.output_packets_successfully_muxed_so_far}\n"
+                f"  Input frames submitted so far      : "
+                f"{self.frames_successfully_encoded_so_far}"
+            )
 
         self._logger.debug(
             f"Encoder emitted packet: "
@@ -2962,46 +3368,75 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             f"is_keyframe={output_packet.is_keyframe}, "
             f"is_corrupt={output_packet.is_corrupt}, "
             f"is_disposable={output_packet.is_disposable}, "
-            f"input_frames_processed_so_far="
-            f"{self.frames_successfully_encoded_so_far}"
+            f"input_frames_submitted_so_far="
+            f"{self.frames_successfully_encoded_so_far}, "
+            f"output_packets_muxed_so_far="
+            f"{self.output_packets_successfully_muxed_so_far}, "
+            f"fifo_depth="
+            f"{len(self._pending_input_frame_pts_fifo_in_stream_time_base_units)}"
         )
 
-        # Flag every observed disagreement between Intel's
-        # libmfx-derived value and the spec-correct synthesized
-        # value at WARNING level. On a working Intel oneVPL runtime
-        # the two would agree on every packet and these WARNINGs
-        # would never fire; on the reference target hardware they
-        # fire from approximately the 6th output packet onward,
-        # which is the empirical fingerprint of Intel's
-        # ``mfxBitstream.TimeStamp``-not-populated defect.
+        # Rate-limited disagreement WARNING. The first observed
+        # disagreement always emits a verbose ``WARNING`` carrying
+        # the full diagnostic context the operator needs to file
+        # an Intel oneVPL runtime issue (citing the
+        # ``libavcodec/qsvenc.c`` line 2667 mapping and the
+        # ``intel/vpl-gpu-rt`` issue tracker). Subsequent
+        # disagreements bump the running counter; one short
+        # ``WARNING`` tally line per
+        # ``_INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS``
+        # packets keeps the operator informed without unbounded
+        # ``session.log`` growth. Every disagreement is still
+        # captured at ``DEBUG`` via the line above.
         if (
             libmfx_derived_packet_pts_in_stream_time_base_units
             != synthesized_pts_and_dts_in_stream_time_base_units
         ):
-            self._logger.warning(
-                f"Intel oneVPL runtime emitted an output packet "
-                f"whose libmfx-derived ``pkt.pts`` "
-                f"({libmfx_derived_packet_pts_in_stream_time_base_units}) "
-                f"disagrees with the spec-correct value for a "
-                f"B-frame-free H.264 GOP under this program's "
-                f"configuration "
-                f"({synthesized_pts_and_dts_in_stream_time_base_units}). "
-                f"libmfx's value is being discarded. Most likely "
-                f"cause: ``intel/vpl-gpu-rt`` left "
-                f"``mfxBitstream.TimeStamp`` at the "
-                f"``MFX_TIMESTAMP_UNKNOWN`` sentinel or its "
-                f"``av_mallocz``-zeroed initial value, and "
-                f"``libavcodec/qsvenc.c`` line 2667 mapped that to "
-                f"``av_rescale_q(...)`` = 0 without the "
-                f"``MFX_TIMESTAMP_UNKNOWN`` sanitisation present in "
-                f"the sister file ``qsvdec.c`` lines 64-70. Output "
-                f"packet index : "
-                f"{synthesized_pts_and_dts_in_stream_time_base_units}, "
-                f"input frames processed so far : "
-                f"{self.frames_successfully_encoded_so_far}, "
-                f"size_bytes : {output_packet.size}, "
-                f"is_keyframe : {output_packet.is_keyframe}."
-            )
+            self.total_intel_onevpl_pts_disagreements_observed += 1
+            if self.total_intel_onevpl_pts_disagreements_observed == 1:
+                self._logger.warning(
+                    f"FIRST observed disagreement between the Intel "
+                    f"oneVPL runtime's libmfx-derived ``pkt.pts`` "
+                    f"({libmfx_derived_packet_pts_in_stream_time_base_units}) "
+                    f"and the spec-correct synthesized PTS for the "
+                    f"current output packet "
+                    f"({synthesized_pts_and_dts_in_stream_time_base_units}). "
+                    f"libmfx's value is being discarded; the "
+                    f"synthesized value is the spec-correct PTS for "
+                    f"a B-frame-free H.264 GOP under this program's "
+                    f"configuration. Most likely cause: "
+                    f"``intel/vpl-gpu-rt`` left "
+                    f"``mfxBitstream.TimeStamp`` at the "
+                    f"``MFX_TIMESTAMP_UNKNOWN`` sentinel or its "
+                    f"``av_mallocz``-zeroed initial value, and "
+                    f"``libavcodec/qsvenc.c`` line 2667 mapped that "
+                    f"to ``av_rescale_q(...)`` = 0 without the "
+                    f"``MFX_TIMESTAMP_UNKNOWN`` sanitisation present "
+                    f"in the sister file ``qsvdec.c`` lines 64-70. "
+                    f"Output packet index : "
+                    f"{synthesized_pts_and_dts_in_stream_time_base_units}, "
+                    f"input frames submitted so far : "
+                    f"{self.frames_successfully_encoded_so_far}, "
+                    f"size_bytes : {output_packet.size}, "
+                    f"is_keyframe : {output_packet.is_keyframe}. "
+                    f"Subsequent disagreements during this session "
+                    f"will be summarised at "
+                    f"``DEBUG`` per packet and ``WARNING`` once per "
+                    f"{self._INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS} "
+                    f"packets, with a final count logged at "
+                    f"encoder-worker exit."
+                )
+            elif (
+                self.total_intel_onevpl_pts_disagreements_observed
+                % self._INTEL_ONEVPL_PTS_DISAGREEMENT_WARNING_LOG_PERIOD_PACKETS
+                == 0
+            ):
+                self._logger.warning(
+                    f"Intel oneVPL runtime PTS disagreement count "
+                    f"so far this session: "
+                    f"{self.total_intel_onevpl_pts_disagreements_observed} "
+                    f"(rate-limited; full per-packet detail at DEBUG)."
+                )
 
         # Overwrite both PTS and DTS with the spec-correct
         # synthesized value. PTS == DTS for a B-frame-free GOP per
@@ -3014,12 +3449,11 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             synthesized_pts_and_dts_in_stream_time_base_units
         )
 
-        # Advance the counter exactly once per muxed packet, so
-        # that the next packet's synthesized value is strictly
-        # one greater.
-        self._next_synthesized_output_packet_pts_in_stream_time_base_units += 1
-
+        self._last_muxed_synthesized_output_packet_pts_in_stream_time_base_units = (
+            synthesized_pts_and_dts_in_stream_time_base_units
+        )
         output_container.mux(output_packet)
+        self.output_packets_successfully_muxed_so_far += 1
 
     def _verify_encoder_codec_context_post_open_state_matches_explicit_configuration(
         self,
@@ -4338,6 +4772,16 @@ class RecordingSessionController:
                 ),
                 "frames_successfully_encoded_total": (
                     encoder_w.frames_successfully_encoded_so_far
+                    if encoder_w is not None
+                    else 0
+                ),
+                "output_packets_successfully_muxed_total": (
+                    encoder_w.output_packets_successfully_muxed_so_far
+                    if encoder_w is not None
+                    else 0
+                ),
+                "intel_onevpl_runtime_pts_disagreements_observed_total": (
+                    encoder_w.total_intel_onevpl_pts_disagreements_observed
                     if encoder_w is not None
                     else 0
                 ),
