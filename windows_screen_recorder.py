@@ -188,6 +188,8 @@ from typing import Any, Final, Optional
 # ----------------------------------------------------------------------------
 import av  # PyAV: Python bindings to FFmpeg libavcodec / libavformat
 import av.codec  # explicit submodule for av.codec.Codec(name, mode)
+import av.error  # explicit submodule for av.error.FFmpegError attribute set
+import av.logging  # explicit submodule for av.logging.set_level / get_last_error
 import mss  # python-mss: GDI-BitBlt-based Windows screenshot library
 import mss.base  # explicit submodule for mss.base.MSSBase type annotations
 import numpy as np
@@ -676,6 +678,55 @@ def _opt_into_per_monitor_v2_dpi_awareness() -> None:
         "program does not target. The expected target host operating system "
         "is Microsoft Windows 10 version 1703 or later. Aborting."
     )
+
+
+def _opt_into_libav_verbose_diagnostic_log_capture() -> None:
+    """Install PyAV's real logging callback so ``FFmpegError.log`` is populated.
+
+    PyAV by default installs ``nolog_callback`` (a no-op cffi callback) as the
+    libav-level log sink - see ``av/logging.py`` line ~308 in PyAV 17.x:
+
+        lib.av_log_set_callback(nolog_callback)
+
+    With that callback active, every libav log line (including
+    ``AV_LOG_ERROR`` lines emitted immediately before libav returns a fatal
+    error code) is discarded. The on-exception ``FFmpegError.log`` attribute
+    that PyAV's ``err_check`` reads from ``av.logging.get_last_error()`` is
+    therefore always ``None``, so an EINVAL out of (say) the mp4 muxer's
+    strict-monotonic-DTS guard surfaces to Python as the maddeningly empty::
+
+        Invalid argument: 'recording.mp4' returned 22
+
+    with no indication of *which* of the dozens of EINVAL paths inside
+    ``libavcodec`` / ``libavformat`` actually fired.
+
+    Calling ``av.logging.set_level(<int>)`` at process start replaces
+    ``nolog_callback`` with the real ``log_callback`` (``av/logging.py`` line
+    ~88), which unconditionally records every ``AV_LOG_ERROR`` line into
+    PyAV's ``last_error`` slot regardless of the chosen threshold. The next
+    ``err_check`` call then attaches that line to the raised exception as a
+    ``(level, source_name, message)`` tuple on ``FFmpegError.log``.
+
+    ``av.logging.VERBOSE`` is chosen over ``DEBUG`` deliberately: the
+    diagnostic payload we care about (eg the mp4 muxer's
+    ``"Application provided invalid, non monotonically increasing dts to
+    muxer"`` line, or h264_qsv's ``"Error during encoding: invalid video
+    parameters"`` line) is emitted at ``AV_LOG_ERROR`` and is captured at
+    every threshold from ``QUIET`` to ``TRACE``. ``VERBOSE`` keeps
+    libavformat's per-frame muxer chatter out of stderr (the default
+    callback also writes to stderr at the chosen threshold) while still
+    surfacing every codec-level warning that might foreshadow a later
+    fatal.
+
+    Must be called exactly once and before any libav call - in particular
+    before the ``av.codec.Codec(name, mode)`` probe done at startup to
+    verify the ``h264_qsv`` encoder is available. We deliberately do NOT
+    wrap this in try/except: if PyAV's logging API surface ever moves, we
+    want a loud ``AttributeError`` at startup rather than a silent fallback
+    to the no-op callback that would erase our ability to diagnose any
+    future encoder failure.
+    """
+    av.logging.set_level(av.logging.VERBOSE)
 
 
 # Microsoft Windows' nominal "logical DPI" baseline: at 100% display
@@ -2002,6 +2053,83 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 # Section 14 - Encoder thread: PyAV / Intel Quick Sync H.264 consumer
 # ============================================================================
 
+
+def _format_encoder_pipeline_error_message_from_ffmpeg_error(
+    *,
+    failing_frame_pts: Optional[int],
+    frame_buffer_shape: Optional[tuple[int, ...]],
+    frame_buffer_dtype: Optional[str],
+    phase_human_readable: str,
+    ffmpeg_error: "av.FFmpegError",
+) -> str:
+    """Build a forensic-grade ``EncoderPipelineError`` message from a PyAV error.
+
+    Surfaces every PyAV-exposed libav-side field on the
+    ``av.FFmpegError`` instance:
+
+      * ``errno``        - the integer libav error code (eg 22 for EINVAL).
+      * ``strerror``     - libav's textual rendering of that errno.
+      * ``filename``     - the ``AVFormatContext`` URL identifier *or* the
+                           libavcodec function name. CRITICAL for triage:
+                           if it holds the output container path, the
+                           failure is inside ``av_interleaved_write_frame``
+                           (the muxer); if it holds
+                           ``"avcodec_send_frame()"`` /
+                           ``"avcodec_receive_packet()"``, the failure is
+                           inside libavcodec (the encoder). See
+                           ``av/container/output.py`` + ``av/codec/context.py``.
+      * ``log``          - the ``(level, source_name, message)`` tuple
+                           captured by PyAV's logging callback at the
+                           moment the error was raised, populated only
+                           because we called
+                           ``_opt_into_libav_verbose_diagnostic_log_capture``
+                           at startup. Carries the actual libav line, eg::
+
+                               (16, 'mov', 'Application provided invalid,
+                                non monotonically increasing dts to muxer
+                                in stream 0: 0 >= 0')
+
+                           which is what makes the difference between "we
+                           know what failed" and "we are debugging blind".
+
+    We deliberately do NOT swallow or rename the libav errno - the message
+    is meant to land verbatim in the operator's error message-box and the
+    session.log forensic artifact.
+    """
+    if ffmpeg_error.log is not None:
+        log_level_int, log_source_name, log_message_text = ffmpeg_error.log
+        rendered_log_line = (
+            f"[level={log_level_int}, source={log_source_name!r}] "
+            f"{log_message_text.strip()}"
+        )
+    else:
+        rendered_log_line = (
+            "(none captured - PyAV's logging callback did not record an "
+            "AV_LOG_ERROR line before err_check raised; this should be "
+            "impossible because _opt_into_libav_verbose_diagnostic_log_capture "
+            "is called at process start)"
+        )
+
+    return (
+        f"PyAV / Intel Quick Sync Video encoding pipeline raised an "
+        f"av.FFmpegError during the {phase_human_readable} phase.\n"
+        f"  Failing frame PTS         : {failing_frame_pts}\n"
+        f"  Frame buffer shape        : {frame_buffer_shape}\n"
+        f"  Frame buffer dtype        : {frame_buffer_dtype}\n"
+        f"  libav errno               : {ffmpeg_error.errno}\n"
+        f"  libav strerror            : {ffmpeg_error.strerror!r}\n"
+        f"  PyAV filename / context   : {ffmpeg_error.filename!r}\n"
+        f"      ^ if this is the output container's path "
+        f"(eg 'recording.mp4'), the EINVAL came from "
+        f"av_interleaved_write_frame inside the muxer; if it is "
+        f"'avcodec_send_frame()' or 'avcodec_receive_packet()', "
+        f"the EINVAL came from libavcodec inside the encoder.\n"
+        f"  Last captured libav log   : {rendered_log_line}\n"
+        f"  PyAV exception class      : "
+        f"{type(ffmpeg_error).__name__}"
+    )
+
+
 class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
     """Worker thread that encodes BGRA frames into a fragmented MP4 via PyAV.
 
@@ -2186,19 +2314,48 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                         av_nv12_video_frame
                     ):
                         output_container.mux(output_packet)
-                except Exception as encode_exc:
+                except av.FFmpegError as ffmpeg_err:
                     raise EncoderPipelineError(
-                        f"PyAV / Intel Quick Sync Video encoding failed on "
-                        f"a frame.\n"
-                        f"  Failing frame PTS : "
+                        _format_encoder_pipeline_error_message_from_ffmpeg_error(
+                            failing_frame_pts=(
+                                captured_frame
+                                .presentation_timestamp_in_one_frame_units
+                            ),
+                            frame_buffer_shape=(
+                                captured_frame
+                                .bgra_frame_pixel_buffer
+                                .shape
+                            ),
+                            frame_buffer_dtype=str(
+                                captured_frame
+                                .bgra_frame_pixel_buffer
+                                .dtype
+                            ),
+                            phase_human_readable=(
+                                "per-frame encode + mux"
+                            ),
+                            ffmpeg_error=ffmpeg_err,
+                        )
+                    ) from ffmpeg_err
+                except Exception as non_ffmpeg_exc:
+                    # A non-libav Python exception (eg a numpy shape
+                    # mismatch from upstream capture). We do not try to
+                    # squeeze libav-specific fields out of it; we surface
+                    # the Python exception verbatim so the failure stays
+                    # diagnosable without us pretending it came from
+                    # FFmpeg.
+                    raise EncoderPipelineError(
+                        f"PyAV / Intel Quick Sync Video encoding pipeline "
+                        f"raised a non-libav Python exception on a frame.\n"
+                        f"  Failing frame PTS  : "
                         f"{captured_frame.presentation_timestamp_in_one_frame_units}\n"
                         f"  Frame buffer shape : "
                         f"{captured_frame.bgra_frame_pixel_buffer.shape}\n"
                         f"  Frame buffer dtype : "
                         f"{captured_frame.bgra_frame_pixel_buffer.dtype}\n"
-                        f"  Underlying          : "
-                        f"{type(encode_exc).__name__}: {encode_exc}"
-                    ) from encode_exc
+                        f"  Underlying Python  : "
+                        f"{type(non_ffmpeg_exc).__name__}: {non_ffmpeg_exc}"
+                    ) from non_ffmpeg_exc
 
                 self.frames_successfully_encoded_so_far += 1
 
@@ -2207,15 +2364,32 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 try:
                     for trailing_packet in output_stream.encode(None):
                         output_container.mux(trailing_packet)
-                except Exception as flush_exc:
+                except av.FFmpegError as ffmpeg_err:
+                    raise EncoderPipelineError(
+                        _format_encoder_pipeline_error_message_from_ffmpeg_error(
+                            failing_frame_pts=None,
+                            frame_buffer_shape=None,
+                            frame_buffer_dtype=None,
+                            phase_human_readable=(
+                                f"libavcodec flush "
+                                f"(stream.encode(None)); "
+                                f"frames successfully encoded before "
+                                f"flush: "
+                                f"{self.frames_successfully_encoded_so_far}"
+                            ),
+                            ffmpeg_error=ffmpeg_err,
+                        )
+                    ) from ffmpeg_err
+                except Exception as non_ffmpeg_flush_exc:
                     raise EncoderPipelineError(
                         f"PyAV / Intel Quick Sync Video encoder flush "
-                        f"(stream.encode(None)) failed.\n"
-                        f"  Frames successfully encoded before flush: "
+                        f"raised a non-libav Python exception.\n"
+                        f"  Frames successfully encoded before flush : "
                         f"{self.frames_successfully_encoded_so_far}\n"
-                        f"  Underlying : "
-                        f"{type(flush_exc).__name__}: {flush_exc}"
-                    ) from flush_exc
+                        f"  Underlying Python                         : "
+                        f"{type(non_ffmpeg_flush_exc).__name__}: "
+                        f"{non_ffmpeg_flush_exc}"
+                    ) from non_ffmpeg_flush_exc
         finally:
             try:
                 output_container.close()
@@ -3671,6 +3845,20 @@ class _OperatorTkinterGui:
         self._tk_root = tk.Tk()
         self._tk_root.title(GUI_WINDOW_TITLE_TEXT)
 
+        # Withdraw the root window immediately on construction so it is
+        # invisible during every subsequent sizing / layout step below
+        # (DPI re-scaling, ttk theme activation, widget construction,
+        # the ``update_idletasks`` + ``update`` event-pump pair that
+        # forces the wraplength-bound labels' ``<Configure>`` callbacks
+        # to settle, and the final position-only ``geometry`` call).
+        # Without this, the operator can briefly see the window flash
+        # onto the screen at the wrong size, at the wrong position, or
+        # at default (top-left of Display 1) coordinates. We
+        # ``deiconify`` exactly once, at the very end of this method,
+        # after the layout has stabilized and the window has been
+        # placed on Microsoft Windows Display 2.
+        self._tk_root.withdraw()
+
         # CRITICAL ORDERING: before *any* ttk widget is constructed
         # and before *any* font measurement is taken, re-scale Tcl/Tk
         # to the effective DPI of the Microsoft Windows monitor we
@@ -3772,7 +3960,45 @@ class _OperatorTkinterGui:
         # exact failure mode the previous fixed-pixel layout exhibited
         # under non-default Microsoft Windows display scaling.
         self._tk_root.resizable(True, True)
+
+        # Force the layout to fully settle BEFORE we read winfo_reqheight
+        # for ``minsize``. Two passes are required, in this exact order,
+        # for a specific reason rooted in Tcl/Tk's event model:
+        #
+        # ``update_idletasks`` (see ``generic/tkEvent.c::Tcl_DoOneEvent``
+        # with the ``TCL_IDLE_EVENTS`` flag) processes only idle
+        # callbacks, which is sufficient for the geometry manager's
+        # negotiation to assign widths to every grid cell. But the
+        # ``<Configure>`` events that fire as those widths change are
+        # *not* idle callbacks - they are window-system events, queued
+        # for the next ``Tcl_DoOneEvent(TCL_WINDOW_EVENTS)`` pass. From
+        # the Tcl ``update`` man page verbatim:
+        #
+        #     "there are some kinds of updates that only happen in
+        #      response to events, such as those triggered by window
+        #      size changes; these updates will not occur in
+        #      ``update idletasks``."
+        #
+        # Our content / status / details labels are bound to a
+        # ``<Configure>``-driven wraplength updater
+        # (``_bind_label_to_dynamic_wraplength``). The first
+        # ``update_idletasks`` settles the grid cell widths; the
+        # ``<Configure>`` events are then queued; ``update`` drains
+        # them, the wraplength bindings fire, the labels potentially
+        # re-flow taller, and the widget tree's ``winfo_reqheight``
+        # grows accordingly. A second ``update_idletasks`` finalizes
+        # any geometry re-negotiation triggered by the re-flow.
+        #
+        # Only then is the natural requested size stable. Reading
+        # ``winfo_reqheight`` before this dance under-reports by
+        # exactly the re-flow growth - which is the precise mechanism
+        # behind the original "bottom half of the Stop button is
+        # clipped" symptom on monitors whose pixel width drives a
+        # narrower-than-initial-wraplength label re-flow.
         self._tk_root.update_idletasks()
+        self._tk_root.update()
+        self._tk_root.update_idletasks()
+
         natural_requested_window_width_pixels = (
             self._tk_root.winfo_reqwidth()
         )
@@ -3783,10 +4009,47 @@ class _OperatorTkinterGui:
             natural_requested_window_width_pixels,
             natural_requested_window_height_pixels,
         )
+
+        # Place the window on Microsoft Windows Display 2 using a
+        # POSITION-ONLY ``geometry`` string (``+X+Y`` with no ``WxH``
+        # prefix). Two distinct correctness properties depend on this:
+        #
+        # (1) The initial visible size will be exactly the natural
+        #     requested size of the laid-out widget tree, because Tk's
+        #     ``UpdateGeometryInfo`` in ``win/tkWinWm.c`` honors
+        #     ``winPtr->reqWidth`` / ``reqHeight`` only when
+        #     ``wmPtr->width == -1`` (its uninitialized sentinel). A
+        #     ``WxH+X+Y`` geometry call writes a non-sentinel
+        #     ``wmPtr->width``, locking the toplevel at the size we
+        #     passed even if children later need more space.
+        #
+        # (2) After this method returns and the GUI mainloop begins
+        #     polling controller state, every status-text update that
+        #     adds a new line to the status or details label causes
+        #     the labels' ``winfo_reqheight`` to grow. With the
+        #     toplevel still at ``wmPtr->width == -1``,
+        #     ``TopLevelReqProc`` (in ``tkWinWm.c``) re-schedules
+        #     ``UpdateGeometryInfo``, which now uses the *new*
+        #     ``reqHeight`` and grows the toplevel accordingly. A
+        #     ``WxH+X+Y`` geometry call would have permanently
+        #     disabled this auto-grow, leaving the operator with a
+        #     window too small to show the longer status text - the
+        #     exact symptom previously observed after a recorder
+        #     fatal-error message inflates the status line.
         self._place_window_on_microsoft_windows_display_2(
-            window_width_pixels=natural_requested_window_width_pixels,
-            window_height_pixels=natural_requested_window_height_pixels,
+            centering_estimated_window_width_pixels=(
+                natural_requested_window_width_pixels
+            ),
+            centering_estimated_window_height_pixels=(
+                natural_requested_window_height_pixels
+            ),
         )
+
+        # Reveal the now-fully-positioned, fully-sized window. After
+        # this point any further layout-driven size growth is handled
+        # by Tk's auto-grow path (see property (2) above), so the
+        # operator never sees a flash or jitter.
+        self._tk_root.deiconify()
 
         # Initial refresh + start the periodic poll.
         self._refresh_gui_for_current_state()
@@ -4130,14 +4393,35 @@ class _OperatorTkinterGui:
     def _place_window_on_microsoft_windows_display_2(
         self,
         *,
-        window_width_pixels: int,
-        window_height_pixels: int,
+        centering_estimated_window_width_pixels: int,
+        centering_estimated_window_height_pixels: int,
     ) -> None:
-        """Place the window centered on Microsoft Windows Display 2.
+        """Center the window on Microsoft Windows Display 2.
 
-        Window width and height come from the laid-out widget tree's
-        natural requested size; this method only decides where on the
-        secondary display to place that window.
+        Emits a POSITION-ONLY ``wm geometry "+X+Y"`` request - never
+        ``WxH+X+Y``. The two width and height arguments are used only
+        to estimate the upper-left corner that will visually center the
+        natural-size window inside Microsoft Windows Display 2's
+        bounding rectangle; they are *not* used to fix the window's
+        size. Tk's geometry manager continues to follow the laid-out
+        widget tree's ``winfo_reqheight`` / ``winfo_reqwidth`` for the
+        actual window dimensions, both initially and when child
+        widgets grow at runtime (eg the status label gaining a line
+        when a recording transitions to ``FATAL_ERROR_OBSERVED``).
+
+        The position-only form is required because of how
+        ``win/tkWinWm.c::ParseGeometry`` and ``UpdateGeometryInfo``
+        interact: any string that begins with a digit (ie a ``WxH``
+        prefix) causes ``ParseGeometry`` to write a non-sentinel
+        ``wmPtr->width``, which then permanently overrides
+        ``winPtr->reqWidth`` inside ``UpdateGeometryInfo``. A leading
+        ``+`` skips the digit branch entirely and leaves
+        ``wmPtr->width == -1`` (the natural-size sentinel) untouched.
+        Reset semantics: the only documented way to release a locked
+        toplevel back to natural-size auto-grow is ``wm geometry ""``,
+        which is brittle to call from inside live state transitions -
+        so the simpler, more defensive contract is "never lock it in
+        the first place".
         """
         assert self._tk_root is not None
         d2 = (
@@ -4146,15 +4430,20 @@ class _OperatorTkinterGui:
         )
         upper_left_x_pixels = d2.bounding_rectangle_left + max(
             0,
-            (d2.bounding_rectangle_width - window_width_pixels) // 2,
+            (
+                d2.bounding_rectangle_width
+                - centering_estimated_window_width_pixels
+            ) // 2,
         )
         upper_left_y_pixels = d2.bounding_rectangle_top + max(
             0,
-            (d2.bounding_rectangle_height - window_height_pixels) // 2,
+            (
+                d2.bounding_rectangle_height
+                - centering_estimated_window_height_pixels
+            ) // 2,
         )
         self._tk_root.geometry(
-            f"{window_width_pixels}x{window_height_pixels}+"
-            f"{upper_left_x_pixels}+{upper_left_y_pixels}"
+            f"+{upper_left_x_pixels}+{upper_left_y_pixels}"
         )
         self._tk_root.update_idletasks()
 
@@ -4681,6 +4970,13 @@ def main() -> int:
         root_logger.error(str(dpi_err))
         _show_pre_gui_fatal_messagebox(dpi_err)
         return 1
+
+    # 3) Install PyAV's real logging callback so any subsequent libav error
+    # (encoder, muxer, color-space converter) carries the underlying libav
+    # log line on the raised exception's ``.log`` attribute. Must happen
+    # before any libav usage - including the ``h264_qsv`` codec availability
+    # probe run by ``_verify_intel_quick_sync_video_h264_encoder_available``.
+    _opt_into_libav_verbose_diagnostic_log_capture()
 
     # 3) Resolve the operator's Videos Known Folder up front, so any error
     # surfaces before the GUI appears.
