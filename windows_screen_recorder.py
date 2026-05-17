@@ -263,34 +263,107 @@ INTEL_QSV_PRESET_VALUE: Final[str] = "veryfast"
 INTEL_QSV_LOOK_AHEAD_VALUE: Final[int] = 0
 # Async depth = 4. FFmpeg's documented default
 # (``libavcodec/qsv_internal.h`` line 50: ``#define ASYNC_DEPTH_DEFAULT 4``)
-# and Intel's reference encoder default
-# (``intel/libvpl-tools/tools/legacy/sample_encode/src/sample_encode.cpp``
-# lines 1748-1749: ``pParams->nAsyncDepth = 4``). An earlier version of
-# this file set ``async_depth = 1`` to minimize end-to-end latency for
-# screen capture. That was a mistake: under
-# ``MFX_RATECONTROL_ICQ + AsyncDepth=1 + GopRefDist=1`` (the exact
-# configuration this program runs on Intel UHD Graphics 770 / 13th-gen
-# Core i7-13700), the ``intel/vpl-gpu-rt`` H.264 hardware pipeline
-# emits its first output packets with ``mfxBitstream.TimeStamp`` left
-# uninitialized at libavcodec's ``av_mallocz``-zeroed sentinel value -
-# and ``libavcodec/qsvenc.c`` line 2667 then translates that sentinel
-# to ``pkt.pts = av_rescale_q(0, ...) = 0`` *without* the
-# ``MFX_TIMESTAMP_UNKNOWN`` sanitisation that exists in ``qsvenc.c``'s
-# sister file ``qsvdec.c`` lines 64-70. The mp4 muxer's strict
-# monotonic-DTS guard then rejects the second output packet that
-# surfaces with ``pkt.pts = 0`` (the duplicate PTS is what our
-# encoder-worker ``strictly_increasing_pts_watchdog`` catches).
-# Intel's own libvpl sample encoder *never* combines AsyncDepth=1 with
-# ICQ - the only modes Intel forces AsyncDepth=1 in are TCBRC and
-# PartialOutput, neither of which we use. Setting AsyncDepth back to
-# the documented default eliminates the pipeline-fill timestamp
-# corruption class - same diagnosis as
+# and Intel's reference encoder default in the Intel-maintained
+# ``intel/libvpl-tools`` repository at
+# ``tools/legacy/sample_encode/src/sample_encode.cpp`` lines 1748-1749:
+# ``pParams->nAsyncDepth = 4``. Lower values risk the
+# ``MFX_RATECONTROL_ICQ + AsyncDepth=1 + GopRefDist=1`` defect class
+# documented for the integrated Intel UHD Graphics 770 GPU and its
+# Intel ``vpl-gpu-rt`` H.264 hardware pipeline: under that combination
+# the encoder emits its first output packets with
+# ``mfxBitstream.TimeStamp`` left uninitialised at libavcodec's
+# ``av_mallocz``-zeroed sentinel value, and ``libavcodec/qsvenc.c``
+# line 2667 then translates that sentinel via
+# ``av_rescale_q(0, ...) = 0`` to ``pkt.pts = 0`` *without* the
+# ``MFX_TIMESTAMP_UNKNOWN`` sanitisation present in ``qsvenc.c``'s
+# sister file ``libavcodec/qsvdec.c`` lines 64-70. FFmpeg's mp4 muxer
+# would then reject the second output packet that surfaces with
+# ``pkt.pts = 0`` via the strict-monotonic-DTS guard at
+# ``libavformat/mux.c`` lines 410-420; the strict-monotonic-PTS
+# watchdog in this program's
+# ``_mux_one_encoded_packet_with_dts_forced_to_pts`` catches the same
+# class of defect one stack frame earlier, with richer Python-side
+# context. Intel's own libvpl sample encoder never combines
+# AsyncDepth=1 with ICQ - the only modes Intel forces AsyncDepth=1
+# in are TCBRC and PartialOutput, neither of which this program uses.
+# The defect class is documented in
 # https://github.com/intel/vpl-gpu-rt/issues/253 for AV1 and
 # https://github.com/Intel-Media-SDK/MediaSDK/issues/978 for the
-# H.264 FEI preencode path. The latency cost is approximately
-# 3 frames at 30 fps = 100 ms end-to-end, which is irrelevant for a
-# screen recorder whose output is a video file (not a live stream).
+# H.264 FEI preencode path. The latency cost of AsyncDepth=4 is
+# approximately 3 frames at 30 fps = 100 ms end-to-end, which is
+# irrelevant for a screen recorder whose output is a video file
+# (not a live stream).
 INTEL_QSV_ASYNC_DEPTH_VALUE: Final[int] = 4
+# Maximum B-frames between non-B-frames: 0 (no B-frames at all).
+#
+# We must set this EXPLICITLY because ``h264_qsv`` overrides FFmpeg's
+# generic AVCodecContext default. The generic libavcodec default for
+# ``bf`` (the AVOption that backs ``avctx->max_b_frames``) is 0, as
+# defined in
+# https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/options_table.h
+# (search for the ``"bf"`` entry; the ``DEFAULT`` macro it references
+# is ``#define DEFAULT 0`` earlier in that file). But the h264_qsv
+# encoder's per-codec defaults table at
+# https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/qsvenc_h264.c#L119
+# overrides that to ``-1`` (the "automatic / libmfx picks" sentinel):
+#
+#     static const FFCodecDefault qsv_enc_defaults[] = {
+#         { "b",  "1M"    },
+#         { "refs",  "0"  },
+#         { "g",  "250"   },
+#         { "bf", "-1"    },
+#         { NULL },
+#     };
+#
+# h264_qsv then computes
+#     ``q->param.mfx.GopRefDist = FFMAX(-1, avctx->max_b_frames) + 1;``
+# at https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/qsvenc.c#L1078,
+# so with the codec-default-overridden ``avctx->max_b_frames = -1``,
+# the result is ``GopRefDist = FFMAX(-1, -1) + 1 = 0``. ``GopRefDist = 0``
+# is the Intel oneVPL runtime's "the runtime picks" sentinel, and on the
+# integrated Intel UHD Graphics 770 GPU on the 13th-generation Intel
+# Core i7-13700 desktop processor (the reference target hardware for
+# this program) the Intel ``vpl-gpu-rt`` runtime picks
+# ``GopRefDist = 3`` (i.e. ``bf = 2`` B-frames between anchors). Without
+# the explicit ``bf = 0`` override below, the encoder therefore emits
+# packets in H.264 decode order rather than display order, producing a
+# PTS sequence like
+#
+#     I(pts=0, dts=-1)  P(pts=3, dts=0)  B(pts=1, dts=1)
+#     B(pts=2, dts=2)   P(pts=6, dts=3)  B(pts=4, dts=4)  B(pts=5, dts=5)
+#     ...
+#
+# - the classic ``bf=2`` GOP pattern in decode order. The strict-
+# monotonic-output-PTS watchdog in
+# ``_mux_one_encoded_packet_with_dts_forced_to_pts`` is the in-program
+# guarantee that this pattern would be rejected loudly rather than
+# muxed silently; this constant is the in-program guarantee that the
+# pattern never reaches the watchdog in the first place.
+#
+# Setting ``bf = 0`` explicitly forces
+# ``GopRefDist = FFMAX(-1, 0) + 1 = 1`` (i.e. no B-frames between
+# anchors). This is REQUIRED for two correctness invariants this
+# program depends on:
+#
+#   1. The ``pkt.dts := pkt.pts`` override in the mux helper is
+#      spec-correct ONLY when there are no B-frames. With B-frames,
+#      DTS < PTS for some packets by the H.264 specification, and
+#      overwriting DTS with PTS would corrupt the decode timing.
+#
+#   2. The strict-monotonic-output-PTS watchdog assumes encode order
+#      equals display order (no reordering). With B-frames, encode
+#      order does not equal display order, so PTS comes out non-
+#      monotonic by design.
+#
+# Both invariants are local Python-side defensive checks. Disabling
+# B-frames here makes them tractable; allowing B-frames would require
+# threading a full PTS/DTS reordering buffer through the mux helper,
+# which has no compelling benefit for this program's content (a
+# Microsoft Windows desktop capture is mostly static text plus
+# occasional motion; the compression efficiency gain from B-frames
+# at quality target 22 is typically under 5%, and is irrelevant for a
+# screen recorder writing to local NTFS).
+INTEL_QSV_MAX_B_FRAMES_VALUE: Final[int] = 0
 # Keyframe interval expressed in frames. We choose 2 wall-clock seconds, so
 # the value is 2 * frame rate. This bounds the lost-on-crash tail to about
 # 2 seconds (the most recently-started fragment).
@@ -2083,8 +2156,95 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 
 
 # ============================================================================
-# Section 14 - Encoder thread: PyAV / Intel Quick Sync H.264 consumer
+# Section 14 - Encoder thread: PyAV / Intel Quick Sync Video H.264 consumer
 # ============================================================================
+#
+# The full top-to-bottom software call chain that one captured Display 1
+# Microsoft-Windows-GDI BGRA pixel buffer travels through, before it
+# leaves this process as a finalized H.264 NAL unit muxed into a
+# fragmented MP4 box on the local NTFS volume, is the following stack
+# of distinct authorship boundaries. Reading this file without an
+# explicit map of the boundaries is a recipe for misattributing bugs;
+# we therefore enumerate them once, in full, here.
+#
+#   1. This long-form Microsoft Windows screen recorder Python script
+#      (single-file authored, this very source file).
+#
+#   2. PyAV (the Python binding to FFmpeg's C libraries:
+#      ``libavcodec`` for codec dispatch, ``libavformat`` for muxer
+#      dispatch, ``libavutil`` for shared primitives, ``libswscale``
+#      for the BGRA-to-NV12 colour-space conversion). PyAV is
+#      Cython-generated. Repository:
+#      https://github.com/PyAV-Org/PyAV. Pinned version: 17.0.1 (see
+#      MINIMUM_REQUIRED_PYAV_VERSION).
+#
+#   3. FFmpeg (the libavcodec / libavformat / libavutil / libswscale
+#      suite of C libraries; PyAV statically links a pinned FFmpeg
+#      via the ``pyav-ffmpeg`` release artifact, which for PyAV 17.0.1
+#      is FFmpeg 8.0.1; see
+#      https://github.com/PyAV-Org/pyav-ffmpeg/releases/tag/8.0.1-5).
+#      FFmpeg's libavcodec dispatches encode calls to the named
+#      encoder; we pin the encoder name to ``h264_qsv``, which is
+#      FFmpeg's wrapper around the Intel Quick Sync Video H.264
+#      encoder session API.
+#
+#   4. FFmpeg's ``h264_qsv`` encoder wrapper, implemented across
+#      ``libavcodec/qsvenc.c`` (the shared QSV plumbing) and
+#      ``libavcodec/qsvenc_h264.c`` (the H.264-specific glue). This
+#      layer translates each libavcodec ``AVPacket`` /
+#      ``AVCodecContext`` encode call into the corresponding Intel
+#      oneVPL C API call (``MFXVideoENCODE_EncodeFrameAsync`` etc.).
+#
+#   5. The Intel oneVPL runtime (formerly known as the Intel Media
+#      SDK; on Microsoft Windows the dynamic-link library
+#      ``libmfx.dll`` or ``libvpl.dll``). This is loaded by FFmpeg
+#      via the Microsoft Windows operating-system loader
+#      (``LoadLibraryExW``) when ``av.codec.Codec("h264_qsv", "w")``
+#      first opens an encoder session. On Microsoft Windows hosts the
+#      runtime implementation is provided by the Intel-maintained
+#      project ``intel/vpl-gpu-rt``
+#      (https://github.com/intel/vpl-gpu-rt), distributed as part of
+#      the Intel Graphics driver package the operator installs.
+#
+#   6. The Intel Graphics driver - on 64-bit Microsoft Windows 10/11
+#      the kernel-mode display miniport driver ``igdkmd64.sys`` plus
+#      the user-mode display driver ``igdumdim64.dll``. The oneVPL
+#      runtime in step 5 calls into the user-mode display driver,
+#      which packages GPU command-buffer submissions for the kernel
+#      to dispatch.
+#
+#   7. The Intel Quick Sync Video fixed-function H.264 encoder block:
+#      a dedicated piece of silicon on the integrated Intel UHD
+#      Graphics 770 GPU. On the reference target hardware - the
+#      13th-generation Intel Core i7-13700 desktop processor - the
+#      Intel UHD Graphics 770 GPU is integrated onto the CPU die.
+#      The Microsoft Windows kernel's GPU scheduler is what actually
+#      dispatches the command buffer to the hardware encoder block.
+#
+# Encoded H.264 NAL units flow back up the same seven-layer chain in
+# reverse, arriving as ``av.Packet`` objects at this script's encoder
+# worker thread (the ``_IntelQuickSyncVideoFragmentedMp4EncoderWorker``
+# class defined below). Each emitted packet is then handed back into
+# layer 2 / 3 via PyAV's ``OutputContainer.mux`` call, which dispatches
+# into FFmpeg's libavformat ``mp4`` muxer; that muxer writes the
+# resulting fragmented-MP4 byte stream via the Microsoft Windows kernel
+# I/O subsystem (``KernelBase.dll!WriteFile`` ->
+# ``ntdll.dll!NtWriteFile`` -> the Microsoft Windows NT kernel I/O
+# Manager -> the NTFS file system driver) onto the per-user temporary
+# directory on the local NTFS volume.
+#
+# Why this matters for the configuration below: layers 4, 5, 6, and 7
+# each have their own independently-versioned defaults, fallbacks, and
+# silent option-coercion behaviours. The constants in Section 2, the
+# ``codec_context.options`` dict written below in ``_run_encode_loop``,
+# the explicit ``codec_context.open(strict=True)`` call we make before
+# the encode loop, and the
+# ``_verify_encoder_codec_context_post_open_state_matches_explicit_configuration``
+# validator that runs immediately after that open() together constrain
+# every configuration knob this program depends on to a single explicit
+# value, AND verify that the value actually made it through every
+# layer that can observe it. We assume nothing about defaults at any
+# layer.
 
 
 def _format_encoder_pipeline_error_message_from_ffmpeg_error(
@@ -2166,28 +2326,70 @@ def _format_encoder_pipeline_error_message_from_ffmpeg_error(
 class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
     """Worker thread that encodes BGRA frames into a fragmented MP4 via PyAV.
 
-    Owns the PyAV ``OutputContainer`` and the H.264 ``h264_qsv`` stream.
-    Intel Quick Sync Video sessions are tied to the thread that first
-    invokes ``stream.encode``, so we both construct and consume the stream
-    here on this single worker thread.
+    Owns the PyAV ``OutputContainer`` and the FFmpeg ``h264_qsv``
+    encoded video stream. An Intel Quick Sync Video encoder session
+    is tied to the thread that first invokes the libavcodec encode
+    entry point (because the Intel oneVPL runtime's session-handle
+    affinity is per-OS-thread), so this class both constructs the
+    PyAV stream and consumes encoded packets from it inside a single
+    Microsoft Windows kernel thread.
 
-    The worker honors two distinct stop signals:
+    Three correctness invariants the worker imposes on the encoded
+    H.264 bitstream, each enforced by an explicit mechanism rather
+    than left to FFmpeg's / Intel oneVPL's default behaviour:
 
-      * The shutdown sentinel singleton pushed by the capture worker on
-        its way out. This is the *graceful* shutdown: we encode every
-        queued frame, flush the encoder via ``stream.encode(None)``, then
-        close the container so the final fragment is finalized.
+    (i)  The output GOP is B-frame-free. The constant
+         ``INTEL_QSV_MAX_B_FRAMES_VALUE = 0`` (Section 2) is passed
+         as the FFmpeg AVOption ``"bf"`` into the codec context's
+         options dict; ``avcodec_open2`` then computes the libmfx
+         GOP-reference-distance parameter as
+         ``q->param.mfx.GopRefDist = FFMAX(-1, 0) + 1 = 1``, which
+         the Intel oneVPL runtime interprets as "no B-frames between
+         anchors". The
+         ``_verify_encoder_codec_context_post_open_state_matches_explicit_configuration``
+         validator reads ``codec_context.max_b_frames`` back after
+         open() and refuses to proceed if FFmpeg or the Intel
+         oneVPL runtime silently coerced it.
+
+    (ii) Each output packet's decode timestamp is set equal to its
+         presentation timestamp, in
+         ``_mux_one_encoded_packet_with_dts_forced_to_pts``. For a
+         B-frame-free H.264 bitstream this is the H.264-spec-correct
+         value by construction (decode order equals display order in
+         a B-frame-free GOP), independent of whatever values the
+         Intel oneVPL runtime's ``mfxBitstream.DecodeTimeStamp``
+         field carries during pipeline fill.
+
+    (iii) Output packets are muxed in strictly-increasing PTS order.
+          The same mux helper refuses to mux any packet whose PTS is
+          not strictly greater than the previously muxed packet's
+          PTS. Strictly redundant with FFmpeg's mp4 muxer's own
+          monotonic-DTS guard at ``libavformat/mux.c`` lines 410-420,
+          but enforced one stack frame earlier so the failure
+          carries this program's diagnostic context rather than a
+          bare libav ``AVERROR(EINVAL)``.
+
+    The worker honours two distinct stop signals:
+
+      * The shutdown sentinel singleton pushed by the capture worker
+        on its way out. This is the *graceful* shutdown: the worker
+        encodes every queued frame, flushes the encoder via
+        ``stream.encode(None)``, then closes the output container
+        so the final fragmented-MP4 fragment is finalised.
 
       * The ``force_cancel_event`` set by the controller's
-        ``request_force_cancel_finalization``. This is the *force*
-        shutdown: as soon as we observe it set we discard whatever
-        frames remain in the queue, skip the ``stream.encode(None)``
-        flush, and close the container as-is. Because the output is
-        fragmented MP4 with ``+frag_keyframe+empty_moov+default_base_moof``,
-        the file is still playable up through whichever fragment was
-        last finalized; the worst possible loss is the in-flight
-        fragment (up to ``KEYFRAME_INTERVAL_FRAMES`` frames worth, i.e.
-        approximately two wall-clock seconds at the default frame rate).
+        ``request_force_cancel_finalization`` entry point. This is
+        the *force* shutdown: as soon as the worker observes the
+        event set, it discards whatever frames remain in the queue,
+        skips the ``stream.encode(None)`` flush, and closes the
+        container as-is. Because the output is fragmented MP4 with
+        the FFmpeg ``movflags`` set
+        ``+frag_keyframe+empty_moov+default_base_moof``, the file is
+        still playable up through whichever fragment was most
+        recently finalised; the worst possible loss is the in-flight
+        fragment (up to ``KEYFRAME_INTERVAL_FRAMES`` frames worth,
+        i.e. approximately two wall-clock seconds at the default
+        frame rate).
     """
 
     # Polling interval the encoder loop uses when blocked on the queue,
@@ -2309,7 +2511,73 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 "look_ahead": str(INTEL_QSV_LOOK_AHEAD_VALUE),
                 "g": str(KEYFRAME_INTERVAL_FRAMES),
                 "async_depth": str(INTEL_QSV_ASYNC_DEPTH_VALUE),
+                # Force B-frames OFF; see the long-form rationale at the
+                # ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant declaration in
+                # Section 2. Encoded packets must come out of FFmpeg's
+                # ``h264_qsv`` wrapper in input order so that the
+                # ``pkt.dts := pkt.pts`` override and the strict-
+                # monotonic-PTS watchdog in
+                # ``_mux_one_encoded_packet_with_dts_forced_to_pts``
+                # are spec-correct rather than approximations.
+                "bf": str(INTEL_QSV_MAX_B_FRAMES_VALUE),
             }
+
+            # Explicitly open the libavcodec ``AVCodecContext`` NOW,
+            # before the first call to ``output_stream.encode(...)``,
+            # so that:
+            #
+            #   (a) FFmpeg's ``avcodec_open2()`` has already run by the
+            #       time we reach the encode loop. ``avcodec_open2()``
+            #       is the libavcodec entry point that parses the
+            #       options dict set above, applies the per-codec
+            #       defaults from ``qsv_enc_defaults[]`` at
+            #       ``libavcodec/qsvenc_h264.c:119``, and ultimately
+            #       initialises the Intel oneVPL encoder session via
+            #       ``MFXVideoENCODE_Init``. Any failure at this step -
+            #       option rejected by libavcodec, Intel oneVPL runtime
+            #       unable to initialise an Intel Quick Sync Video
+            #       session, Intel Graphics driver too old, integrated
+            #       GPU disabled in the system BIOS - surfaces here
+            #       and not on the (unrelated-looking) first frame.
+            #
+            #   (b) The post-init ``AVCodecContext`` fields become
+            #       readable via PyAV's @property accessors on
+            #       ``av.video.codeccontext.VideoCodecContext``. The
+            #       validator below trusts no layer of the seven-layer
+            #       call chain documented at the top of this section
+            #       to have silently coerced any value, and reads each
+            #       field back to compare against the explicit value
+            #       this program requires.
+            try:
+                output_stream.codec_context.open(strict=True)
+            except av.FFmpegError as codec_open_exc:
+                raise EncoderPipelineError(
+                    f"FFmpeg's ``avcodec_open2()`` failed when opening "
+                    f"the ``h264_qsv`` H.264 encoder codec context. "
+                    f"This means one of layers 4 through 7 of the "
+                    f"encoder call chain documented at the top of "
+                    f"Section 14 rejected our configuration: most "
+                    f"commonly the Intel oneVPL runtime was unable "
+                    f"to initialise an Intel Quick Sync Video session "
+                    f"(integrated Intel UHD Graphics 770 GPU disabled "
+                    f"in the system BIOS, Intel Graphics driver too "
+                    f"old, or the ``libmfx.dll`` / ``libvpl.dll`` "
+                    f"runtime is not on the Microsoft Windows DLL "
+                    f"search path), but the same exception is raised "
+                    f"if libavcodec itself rejected any AVOption in "
+                    f"the configuration dict above.\n"
+                    f"  Underlying           : "
+                    f"{type(codec_open_exc).__name__}: {codec_open_exc}\n"
+                    f"  libav errno          : "
+                    f"{getattr(codec_open_exc, 'errno', None)}\n"
+                    f"  libav strerror       : "
+                    f"{getattr(codec_open_exc, 'strerror', None)!r}\n"
+                    f"  Last captured log    : "
+                    f"{getattr(codec_open_exc, 'log', None)!r}"
+                ) from codec_open_exc
+            self._verify_encoder_codec_context_post_open_state_matches_explicit_configuration(
+                output_stream=output_stream,
+            )
 
             while True:
                 # Check the force-cancel signal before every blocking get.
@@ -2686,6 +2954,204 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             output_packet.pts
         )
         output_container.mux(output_packet)
+
+    def _verify_encoder_codec_context_post_open_state_matches_explicit_configuration(
+        self,
+        *,
+        output_stream: "av.video.stream.VideoStream",
+    ) -> None:
+        """Verify the just-opened ``h264_qsv`` codec context matches our explicit configuration.
+
+        Called exactly once, immediately after
+        ``output_stream.codec_context.open(strict=True)`` returns, and
+        before any encode call. By construction, at this point FFmpeg's
+        ``avcodec_open2()`` has finished: it has applied the per-codec
+        defaults from ``qsv_enc_defaults[]`` at
+        ``libavcodec/qsvenc_h264.c:119``, parsed and applied the
+        explicit options dict written in ``_run_encode_loop`` above,
+        initialised the Intel oneVPL encoder session, and returned
+        success. The resulting steady-state values of every
+        ``AVCodecContext`` field that PyAV exposes via the
+        ``av.video.codeccontext.VideoCodecContext`` @property accessors
+        are now readable.
+
+        This validator does not trust any single layer in the seven-
+        layer call chain documented at the top of Section 14 - not
+        PyAV's binding, not FFmpeg's libavcodec dispatcher, not
+        FFmpeg's ``h264_qsv`` encoder wrapper, not the Intel oneVPL
+        runtime that ``h264_qsv`` talks to - to have honoured every
+        option we passed. Any of them could in theory silently coerce,
+        clamp, or substitute a value. We therefore read every field we
+        explicitly configured, exactly once, after open(), and refuse
+        to proceed if it disagrees with the value this program
+        requires.
+
+        Each mismatch raises ``EncoderPipelineError`` with: the
+        expected value (and where it came from inside this source
+        file), the actually-observed value, the layer of the call
+        chain that owns the discrepancy, and the in-program
+        correctness invariant that depends on the field. There is no
+        silent fallback: a single mismatch aborts the encoder worker
+        before any frame is sent to the encoder.
+        """
+        codec_context = output_stream.codec_context
+
+        # (1) Sanity: the codec context must actually be open after
+        # the explicit open() call above. PyAV's CodecContext.open()
+        # is documented to set ``is_open=True`` only after
+        # ``avcodec_open2()`` returns success.
+        if not codec_context.is_open:
+            raise EncoderPipelineError(
+                f"PyAV reports ``codec_context.is_open == False`` "
+                f"after ``codec_context.open(strict=True)`` returned "
+                f"without raising. This violates PyAV's documented "
+                f"contract on ``av.codec.context.CodecContext.open``. "
+                f"The encoder cannot be safely used in this state."
+            )
+
+        # (2) The codec FFmpeg picked must be exactly the one we
+        # asked for. libavcodec's dispatch logic, in principle, could
+        # silently substitute a different encoder if our name is
+        # ambiguous or if a higher-priority encoder claims the same
+        # codec ID. We refuse any silent substitution: we require
+        # Intel Quick Sync Video specifically, because every
+        # downstream invariant in this file (the
+        # MFX_TIMESTAMP_UNKNOWN sanitisation gap we worked around with
+        # the ``pkt.dts := pkt.pts`` override, the
+        # ``GopRefDist=1`` computation derived from
+        # ``max_b_frames=0``, the Intel-specific async_depth=4
+        # pipeline-fill remedy) is specific to FFmpeg's
+        # ``h264_qsv`` wrapper.
+        actual_ffmpeg_encoder_name = codec_context.codec.name
+        if (
+            actual_ffmpeg_encoder_name
+            != INTEL_QUICK_SYNC_VIDEO_H264_ENCODER_FFMPEG_NAME
+        ):
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec dispatched our encoder request "
+                f"to a different encoder than the one this program "
+                f"requires. This program is hard-wired to FFmpeg's "
+                f"``h264_qsv`` H.264 encoder (the FFmpeg wrapper for "
+                f"the Intel Quick Sync Video H.264 encoder session) "
+                f"and is not compatible with any other encoder.\n"
+                f"  Encoder name requested by this program : "
+                f"{INTEL_QUICK_SYNC_VIDEO_H264_ENCODER_FFMPEG_NAME!r}\n"
+                f"  Encoder name FFmpeg actually opened    : "
+                f"{actual_ffmpeg_encoder_name!r}"
+            )
+
+        # (3) ``max_b_frames`` must be exactly 0. The full rationale
+        # is documented at the ``INTEL_QSV_MAX_B_FRAMES_VALUE``
+        # declaration in Section 2: without this, FFmpeg's
+        # ``h264_qsv`` defaults ``avctx->max_b_frames`` to -1 (the
+        # "Intel oneVPL runtime picks" sentinel), the runtime picks
+        # ``GopRefDist=3`` on Intel UHD Graphics 770, and the encoder
+        # emits packets in H.264-decode order (which differs from
+        # display order in a B-frame GOP) - which directly violates
+        # both the ``pkt.dts := pkt.pts`` override and the strict-
+        # monotonic-PTS watchdog in
+        # ``_mux_one_encoded_packet_with_dts_forced_to_pts``.
+        observed_max_b_frames_value = codec_context.max_b_frames
+        if observed_max_b_frames_value != INTEL_QSV_MAX_B_FRAMES_VALUE:
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec ``AVCodecContext.max_b_frames`` "
+                f"does not match the value this program requires for "
+                f"the ``pkt.dts := pkt.pts`` override and the strict-"
+                f"monotonic-PTS watchdog to be H.264-spec-correct. "
+                f"This program is hard-wired to ``max_b_frames = 0`` "
+                f"(B-frames disabled); see the long-form rationale at "
+                f"the ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant in "
+                f"Section 2.\n"
+                f"  Expected ``max_b_frames`` (this program)     : "
+                f"{INTEL_QSV_MAX_B_FRAMES_VALUE}\n"
+                f"  Observed ``max_b_frames`` after open()       : "
+                f"{observed_max_b_frames_value}\n"
+                f"  Source of expected value                     : "
+                f"``INTEL_QSV_MAX_B_FRAMES_VALUE`` in Section 2"
+            )
+
+        # (4) ``gop_size`` (the libavcodec AVCodecContext field that
+        # the ``g=`` AVOption sets) must match
+        # ``KEYFRAME_INTERVAL_FRAMES``. The keyframe interval bounds
+        # the crash-loss tail of the fragmented MP4 output: at most
+        # one keyframe-to-keyframe fragment's worth of frames is lost
+        # if the recorder process is killed mid-recording.
+        observed_gop_size_value = codec_context.gop_size
+        if observed_gop_size_value != KEYFRAME_INTERVAL_FRAMES:
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.gop_size`` does not match the "
+                f"value this program requires.\n"
+                f"  Expected ``gop_size`` (this program) : "
+                f"{KEYFRAME_INTERVAL_FRAMES}\n"
+                f"  Observed ``gop_size`` after open()    : "
+                f"{observed_gop_size_value}\n"
+                f"  Source of expected value              : "
+                f"``KEYFRAME_INTERVAL_FRAMES`` in Section 2"
+            )
+
+        # (5)-(6) ``width`` and ``height`` must match the Microsoft
+        # Windows Display 1 native pixel dimensions we passed in via
+        # the encoder worker constructor. A mismatch here would mean
+        # the encoder session is configured for a different frame
+        # size than the BGRA buffers we will be feeding it, which
+        # would produce either an outright error from
+        # libswscale/Intel oneVPL or a silent stride/alignment
+        # corruption.
+        if codec_context.width != self._width:
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.width`` does not match this "
+                f"program's configured capture width.\n"
+                f"  Expected width (Microsoft Windows Display 1 "
+                f"native pixel width) : {self._width}\n"
+                f"  Observed width after open()                : "
+                f"{codec_context.width}"
+            )
+        if codec_context.height != self._height:
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.height`` does not match this "
+                f"program's configured capture height.\n"
+                f"  Expected height (Microsoft Windows Display 1 "
+                f"native pixel height) : {self._height}\n"
+                f"  Observed height after open()                 : "
+                f"{codec_context.height}"
+            )
+
+        # (7) ``pix_fmt`` must be exactly ``"nv12"``. The Intel Quick
+        # Sync Video H.264 encoder hardware block requires NV12 input
+        # (8-bit 4:2:0 with interleaved chroma); FFmpeg's
+        # ``h264_qsv`` wrapper enforces this at codec init. We
+        # convert each captured BGRA frame to NV12 via libswscale
+        # before feeding the encoder; this check confirms the
+        # encoder will accept what we will produce.
+        observed_pix_fmt_value = codec_context.pix_fmt
+        if observed_pix_fmt_value != "nv12":
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.pix_fmt`` is not ``nv12``. The "
+                f"Intel Quick Sync Video H.264 encoder requires NV12 "
+                f"input (8-bit 4:2:0 with interleaved chroma). The "
+                f"capture worker hands the encoder BGRA pixel "
+                f"buffers, which the encoder worker converts to NV12 "
+                f"via libswscale before encoding.\n"
+                f"  Expected pix_fmt : 'nv12'\n"
+                f"  Observed pix_fmt : {observed_pix_fmt_value!r}"
+            )
+
+        self._logger.info(
+            f"Encoder codec context post-open state passed every "
+            f"explicit-configuration validation check: "
+            f"codec.name={actual_ffmpeg_encoder_name!r}, "
+            f"max_b_frames={observed_max_b_frames_value} "
+            f"(== ``GopRefDist=1`` inside the Intel oneVPL runtime, "
+            f"meaning no B-frames, meaning encoder output order "
+            f"equals input order), "
+            f"gop_size={observed_gop_size_value}, "
+            f"resolution={codec_context.width}x{codec_context.height}, "
+            f"pix_fmt={observed_pix_fmt_value!r}."
+        )
 
     def _discard_queue_remainder_due_to_force_cancel(self) -> None:
         """Drain whatever is still in the inbound queue, counting the loss."""
@@ -3770,6 +4236,7 @@ class RecordingSessionController:
                 "qsv_preset": INTEL_QSV_PRESET_VALUE,
                 "qsv_look_ahead": INTEL_QSV_LOOK_AHEAD_VALUE,
                 "qsv_async_depth": INTEL_QSV_ASYNC_DEPTH_VALUE,
+                "qsv_max_b_frames": INTEL_QSV_MAX_B_FRAMES_VALUE,
                 "target_output_frames_per_second": (
                     TARGET_OUTPUT_FRAMES_PER_SECOND
                 ),
