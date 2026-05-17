@@ -2796,7 +2796,66 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             output_stream.width = self._width
             output_stream.height = self._height
             output_stream.pix_fmt = "nv12"
+            # Time-base of the AVStream inside the output container.
+            # The mp4 muxer rescales every muxed packet's PTS from
+            # ``packet.time_base`` into this stream time-base before
+            # writing it into the file's per-track timescale, so this
+            # is the unit the output MP4 ultimately stores PTS values
+            # in.
             output_stream.time_base = Fraction(
+                1, TARGET_OUTPUT_FRAMES_PER_SECOND
+            )
+            # Time-base of the libavcodec ``AVCodecContext``. This
+            # is a DIFFERENT field from ``AVStream.time_base`` and
+            # must be set independently: PyAV's
+            # ``stream.time_base = ...`` only writes the AVStream
+            # field, not the codec context's. Both fields control
+            # distinct legs of the encoded-MP4 timing arithmetic:
+            #
+            #   * ``stream.time_base`` is the unit in which the
+            #     output MP4 stores its per-track PTS values, after
+            #     libavformat's ``av_interleaved_write_frame``
+            #     rescales each muxed packet into this base.
+            #
+            #   * ``codec_context.time_base`` is the unit in which
+            #     libavcodec interprets the ``pts`` and ``dts``
+            #     fields on every emitted output ``av.Packet``. PyAV
+            #     stamps it onto each packet inside
+            #     ``CodecContext._setup_encoded_packet`` via
+            #     ``packet.ptr.time_base = self.ptr.time_base``.
+            #
+            # When the two disagree, ``av_interleaved_write_frame``
+            # rescales every muxed packet's PTS by the ratio between
+            # them - and the FIFO-popped synthesized PTS values that
+            # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+            # below writes onto ``output_packet.pts`` are computed
+            # by the capture worker in stream time-base units, so
+            # any rescale at mux time corrupts the output MP4's
+            # playback duration relative to the operator's real-
+            # time recording duration by exactly the disagreement
+            # ratio.
+            #
+            # Leaving ``codec_context.time_base`` unset on an H.264
+            # encoder is *not* equivalent to setting it equal to
+            # ``stream.time_base``: libavcodec's default for an
+            # H.264 codec context whose ``framerate`` is derived
+            # from the ``rate`` argument to ``add_stream`` is
+            # ``1 / (ticks_per_frame * framerate)``, with
+            # ``ticks_per_frame = 2`` from the H.264 codec
+            # descriptor's legacy interlaced-fields convention -
+            # i.e. ``1 / (2 * TARGET_OUTPUT_FRAMES_PER_SECOND)`` =
+            # ``1 / 60`` at the program's default 30 fps target,
+            # exactly *half* the stream time-base. The resulting
+            # half-ratio rescale at mux time would halve every PTS
+            # value en route to the MP4 and produce an output that
+            # plays back at exactly 2x real time.
+            #
+            # Setting ``codec_context.time_base`` equal to
+            # ``stream.time_base`` here makes the mux-time rescale
+            # the identity transformation. The post-open validator
+            # below cross-checks that libavcodec did not silently
+            # override this value during ``avcodec_open2``.
+            output_stream.codec_context.time_base = Fraction(
                 1, TARGET_OUTPUT_FRAMES_PER_SECOND
             )
             output_stream.codec_context.options = {
@@ -3128,11 +3187,14 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         ``qsvenc.c``'s sister file ``libavcodec/qsvdec.c`` lines
         64-70 explicitly checking for that exact sentinel on the
         decoder side. ``av_rescale_q(-1, ...)`` and
-        ``av_rescale_q(0, ...)`` both return 0, so PyAV surfaces
-        these broken packets as ``pkt.pts = 0`` - clobbering the
-        muxer's monotonic-DTS invariant and (before this method
-        existed) crashing the encoder worker with a strict-
-        monotonic-PTS watchdog rejection mid-recording.
+        ``av_rescale_q(0, ...)`` both return 0, so a libavcodec
+        consumer that trusts the value PyAV surfaces in
+        ``pkt.pts`` would see those broken packets as ``pkt.pts =
+        0`` mid-stream - clobbering the muxer's monotonic-DTS
+        invariant and producing either an EINVAL rejection at the
+        mp4 muxer's strict-monotonic-DTS guard or a silently
+        truncated output MP4. This method exists to ensure neither
+        outcome is reachable.
 
         Who is at fault, plainly: Intel. The
         ``mfxBitstream.TimeStamp`` field on output is supposed to
@@ -3642,6 +3704,75 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 f"  Observed pix_fmt : {observed_pix_fmt_value!r}"
             )
 
+        # (8)-(9) Time-base agreement between the libavcodec
+        # ``AVCodecContext`` and the libavformat ``AVStream``. Both
+        # must equal ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``
+        # so that the FIFO-popped PTS values this program writes
+        # onto ``output_packet.pts`` in
+        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+        # traverse ``av_interleaved_write_frame`` unchanged, and so
+        # the unit the output MP4 stores its per-track PTS values
+        # in is the same unit the capture worker computes those
+        # values in. Any disagreement is a non-identity rescale at
+        # mux time, and the output MP4 plays back faster or slower
+        # than the operator's real-time recording duration by
+        # exactly that ratio: see the long-form rationale at the
+        # ``codec_context.time_base`` assignment in
+        # ``_run_encode_loop`` above for the H.264-specific
+        # libavcodec default of ``1 / (ticks_per_frame * framerate)``
+        # and its 2x-faster-playback consequence on this program's
+        # 30 fps target rate.
+        expected_time_base_in_stream_time_base_units = Fraction(
+            1, TARGET_OUTPUT_FRAMES_PER_SECOND
+        )
+        observed_codec_context_time_base_value = (
+            codec_context.time_base
+        )
+        if (
+            observed_codec_context_time_base_value
+            != expected_time_base_in_stream_time_base_units
+        ):
+            raise EncoderPipelineError(
+                f"FFmpeg's libavcodec "
+                f"``AVCodecContext.time_base`` does not match the "
+                f"value this program requires for the FIFO-popped "
+                f"PTS / DTS overrides in "
+                f"``_mux_one_encoded_packet_with_synthesized_pts_and_dts`` "
+                f"to be muxed without rescaling.\n"
+                f"  Expected ``codec_context.time_base`` : "
+                f"{expected_time_base_in_stream_time_base_units} "
+                f"(= 1 / TARGET_OUTPUT_FRAMES_PER_SECOND)\n"
+                f"  Observed ``codec_context.time_base`` : "
+                f"{observed_codec_context_time_base_value}\n"
+                f"This typically indicates that libavcodec's "
+                f"``avcodec_open2`` overrode the explicit "
+                f"``codec_context.time_base`` this program set "
+                f"before ``open()``, in favour of the H.264 codec "
+                f"descriptor's ``ticks_per_frame``-derived default "
+                f"of ``1 / (ticks_per_frame * framerate)``."
+            )
+        observed_stream_time_base_value = output_stream.time_base
+        if (
+            observed_stream_time_base_value
+            != expected_time_base_in_stream_time_base_units
+        ):
+            raise EncoderPipelineError(
+                f"FFmpeg's libavformat ``AVStream.time_base`` does "
+                f"not match the value this program requires for "
+                f"the FIFO-popped PTS / DTS overrides to be muxed "
+                f"without rescaling.\n"
+                f"  Expected ``stream.time_base`` : "
+                f"{expected_time_base_in_stream_time_base_units} "
+                f"(= 1 / TARGET_OUTPUT_FRAMES_PER_SECOND)\n"
+                f"  Observed ``stream.time_base`` : "
+                f"{observed_stream_time_base_value}\n"
+                f"This typically indicates that the mp4 muxer's "
+                f"``avformat_write_header`` adjusted the stream's "
+                f"time-base to one of its supported per-track "
+                f"timescales after this program's explicit "
+                f"assignment."
+            )
+
         self._logger.info(
             f"Encoder codec context post-open state passed every "
             f"explicit-configuration validation check: "
@@ -3652,7 +3783,11 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             f"equals input order), "
             f"gop_size={observed_gop_size_value}, "
             f"resolution={codec_context.width}x{codec_context.height}, "
-            f"pix_fmt={observed_pix_fmt_value!r}."
+            f"pix_fmt={observed_pix_fmt_value!r}, "
+            f"codec_context.time_base="
+            f"{observed_codec_context_time_base_value}, "
+            f"stream.time_base="
+            f"{observed_stream_time_base_value}."
         )
 
     def _discard_queue_remainder_due_to_force_cancel(self) -> None:
@@ -5212,11 +5347,15 @@ class _OperatorTkinterGui:
 
         self._construct_all_widgets()
 
-        # Allow the operator to resize the window. The minimum size is
-        # the natural requested size of the widget tree after layout -
-        # below that, ttk would clip labels or buttons, which was the
-        # exact failure mode the previous fixed-pixel layout exhibited
-        # under non-default Microsoft Windows display scaling.
+        # Allow the operator to resize the window. The minimum
+        # size is the natural requested size of the widget tree
+        # after layout - below that, ttk silently clips labels or
+        # buttons rather than reflowing them, which is the failure
+        # mode any fixed-pixel layout exhibits under non-default
+        # Microsoft Windows display scaling. The natural-requested
+        # ``minsize`` floor below ensures every ttk label and
+        # button stays fully visible at the smallest size the
+        # operator is allowed to drag the window down to.
         self._tk_root.resizable(True, True)
 
         # Force the layout to fully settle BEFORE we read winfo_reqheight
@@ -5289,11 +5428,11 @@ class _OperatorTkinterGui:
         #     ``TopLevelReqProc`` (in ``tkWinWm.c``) re-schedules
         #     ``UpdateGeometryInfo``, which now uses the *new*
         #     ``reqHeight`` and grows the toplevel accordingly. A
-        #     ``WxH+X+Y`` geometry call would have permanently
-        #     disabled this auto-grow, leaving the operator with a
-        #     window too small to show the longer status text - the
-        #     exact symptom previously observed after a recorder
-        #     fatal-error message inflates the status line.
+        #     ``WxH+X+Y`` geometry call would permanently disable
+        #     this auto-grow, leaving the operator with a window
+        #     too small to show the longer status text the moment
+        #     a recorder fatal-error message inflates the status
+        #     line.
         self._place_window_on_microsoft_windows_display_2(
             centering_estimated_window_width_pixels=(
                 natural_requested_window_width_pixels
@@ -5605,14 +5744,16 @@ class _OperatorTkinterGui:
     ) -> None:
         """Make ``label.wraplength`` track the label's current width.
 
-        Without this binding a ttk.Label with multi-line text refuses
-        to wrap dynamically: it keeps the wraplength it was given at
-        construction time, and any text wider than that wraplength
-        either clips or, if no wraplength was given, pushes the
-        containing window arbitrarily wide. (That second failure mode
-        is the runaway-horizontal-growth behaviour the previous fixed-
-        pixel layout exhibited at high Microsoft Windows display
-        scaling.)
+        Without this binding a ttk.Label with multi-line text
+        refuses to wrap dynamically: it keeps the wraplength it
+        was given at construction time, and any text wider than
+        that wraplength either clips or, if no wraplength was
+        given, pushes the containing window arbitrarily wide.
+        That second failure mode is the runaway-horizontal-growth
+        behaviour any fixed-pixel layout exhibits at high
+        Microsoft Windows display scaling, where the unbounded
+        natural width of a long status line can drive the toplevel
+        window wider than the entire Display 2 bounding rectangle.
 
         With this binding the label rewraps every time the operator
         drags the window edges - narrower text wraps to more lines,
