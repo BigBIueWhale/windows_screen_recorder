@@ -253,11 +253,44 @@ INTEL_QUICK_SYNC_VIDEO_H264_ENCODER_FFMPEG_NAME: Final[str] = "h264_qsv"
 # spot; we pick 22 for visibly-lossless screen recording at moderate bitrate.
 INTEL_QSV_GLOBAL_QUALITY_VALUE: Final[int] = 22
 INTEL_QSV_PRESET_VALUE: Final[str] = "veryfast"
-# Disable QSV look-ahead: it costs latency we do not need for screen capture.
+# Disable QSV look-ahead. ``look_ahead`` is already FFmpeg's documented
+# default (``libavcodec/qsvenc_h264.c`` line 133:
+# ``AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE``), so passing it explicitly
+# is redundant - we set it explicitly anyway because we depend on the
+# value, and not depending on a default is the surgically explicit
+# choice for a codec option whose default has shifted across past
+# FFmpeg releases.
 INTEL_QSV_LOOK_AHEAD_VALUE: Final[int] = 0
-# Async depth of 1 minimizes the QSV pipeline latency; we are not bandwidth
-# limited so the throughput cost of async_depth=1 is irrelevant.
-INTEL_QSV_ASYNC_DEPTH_VALUE: Final[int] = 1
+# Async depth = 4. FFmpeg's documented default
+# (``libavcodec/qsv_internal.h`` line 50: ``#define ASYNC_DEPTH_DEFAULT 4``)
+# and Intel's reference encoder default
+# (``intel/libvpl-tools/tools/legacy/sample_encode/src/sample_encode.cpp``
+# lines 1748-1749: ``pParams->nAsyncDepth = 4``). An earlier version of
+# this file set ``async_depth = 1`` to minimize end-to-end latency for
+# screen capture. That was a mistake: under
+# ``MFX_RATECONTROL_ICQ + AsyncDepth=1 + GopRefDist=1`` (the exact
+# configuration this program runs on Intel UHD Graphics 770 / 13th-gen
+# Core i7-13700), the ``intel/vpl-gpu-rt`` H.264 hardware pipeline
+# emits its first output packets with ``mfxBitstream.TimeStamp`` left
+# uninitialized at libavcodec's ``av_mallocz``-zeroed sentinel value -
+# and ``libavcodec/qsvenc.c`` line 2667 then translates that sentinel
+# to ``pkt.pts = av_rescale_q(0, ...) = 0`` *without* the
+# ``MFX_TIMESTAMP_UNKNOWN`` sanitisation that exists in ``qsvenc.c``'s
+# sister file ``qsvdec.c`` lines 64-70. The mp4 muxer's strict
+# monotonic-DTS guard then rejects the second output packet that
+# surfaces with ``pkt.pts = 0`` (the duplicate PTS is what our
+# encoder-worker ``strictly_increasing_pts_watchdog`` catches).
+# Intel's own libvpl sample encoder *never* combines AsyncDepth=1 with
+# ICQ - the only modes Intel forces AsyncDepth=1 in are TCBRC and
+# PartialOutput, neither of which we use. Setting AsyncDepth back to
+# the documented default eliminates the pipeline-fill timestamp
+# corruption class - same diagnosis as
+# https://github.com/intel/vpl-gpu-rt/issues/253 for AV1 and
+# https://github.com/Intel-Media-SDK/MediaSDK/issues/978 for the
+# H.264 FEI preencode path. The latency cost is approximately
+# 3 frames at 30 fps = 100 ms end-to-end, which is irrelevant for a
+# screen recorder whose output is a video file (not a live stream).
+INTEL_QSV_ASYNC_DEPTH_VALUE: Final[int] = 4
 # Keyframe interval expressed in frames. We choose 2 wall-clock seconds, so
 # the value is 2 * frame rate. This bounds the lost-on-crash tail to about
 # 2 seconds (the most recently-started fragment).
@@ -2482,6 +2515,36 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
            signal either a libmfx bug we cannot work around or an
            unexpected B-frame leaking into the GOP.
         """
+        # Snapshot the libmfx-derived packet metadata BEFORE the
+        # ``pkt.dts := pkt.pts`` override and BEFORE any other
+        # mutation. Logged at DEBUG so the per-session ``session.log``
+        # carries a complete forensic trail of every packet h264_qsv
+        # ever emitted on this session - PTS, the raw libmfx-derived
+        # DTS (before override), size, duration, flags, and the
+        # running input-frame counter. Investigating any future
+        # encoder anomaly starts from this trace.
+        libmfx_derived_packet_pts_in_stream_time_base_units = (
+            output_packet.pts
+        )
+        libmfx_derived_packet_dts_before_override_in_stream_time_base_units = (
+            output_packet.dts
+        )
+        self._logger.debug(
+            f"Encoder emitted packet: "
+            f"pts={libmfx_derived_packet_pts_in_stream_time_base_units}, "
+            f"dts_raw_pre_override="
+            f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}, "
+            f"size_bytes={output_packet.size}, "
+            f"duration={output_packet.duration}, "
+            f"is_keyframe={output_packet.is_keyframe}, "
+            f"is_corrupt={output_packet.is_corrupt}, "
+            f"is_disposable={output_packet.is_disposable}, "
+            f"input_frames_processed_so_far="
+            f"{self.frames_successfully_encoded_so_far}, "
+            f"previously_muxed_pts="
+            f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}"
+        )
+
         if output_packet.pts is None:
             raise EncoderPipelineError(
                 f"h264_qsv produced an output packet with "
@@ -2497,7 +2560,17 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 f"  Frames successfully encoded before this packet : "
                 f"{self.frames_successfully_encoded_so_far}\n"
                 f"  Most recently muxed packet PTS                  : "
-                f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}"
+                f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}\n"
+                f"  Raw libmfx-derived packet.dts (pre-override)    : "
+                f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}\n"
+                f"  packet.size_bytes                               : "
+                f"{output_packet.size}\n"
+                f"  packet.is_keyframe                              : "
+                f"{output_packet.is_keyframe}\n"
+                f"  packet.is_corrupt                               : "
+                f"{output_packet.is_corrupt}\n"
+                f"  packet.is_disposable                            : "
+                f"{output_packet.is_disposable}"
             )
         previously_muxed_pts = (
             self
@@ -2519,12 +2592,31 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 f"the encode pipeline; either way we refuse to mux "
                 f"a non-monotonic packet because the mp4 muxer "
                 f"would reject it anyway with "
-                f"``AVERROR(EINVAL)``.\n"
-                f"  Previously muxed packet PTS : "
+                f"``AVERROR(EINVAL)``. The most likely upstream "
+                f"defect for a duplicate-PTS observation specifically "
+                f"is the unsanitised ``MFX_TIMESTAMP_UNKNOWN`` ->\n"
+                f"``av_rescale_q(0, ...) = 0`` mapping at "
+                f"``libavcodec/qsvenc.c`` line 2667, exposed under "
+                f"low-AsyncDepth pipeline fill; raise async_depth in "
+                f"the constant ``INTEL_QSV_ASYNC_DEPTH_VALUE`` and "
+                f"retry.\n"
+                f"  Previously muxed packet PTS                     : "
                 f"{previously_muxed_pts}\n"
-                f"  Current packet PTS          : "
+                f"  Current packet PTS                              : "
                 f"{output_packet.pts}\n"
-                f"  Frames encoded before this  : "
+                f"  Raw libmfx-derived packet.dts (pre-override)    : "
+                f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}\n"
+                f"  packet.size_bytes                               : "
+                f"{output_packet.size}\n"
+                f"  packet.duration                                 : "
+                f"{output_packet.duration}\n"
+                f"  packet.is_keyframe                              : "
+                f"{output_packet.is_keyframe}\n"
+                f"  packet.is_corrupt                               : "
+                f"{output_packet.is_corrupt}\n"
+                f"  packet.is_disposable                            : "
+                f"{output_packet.is_disposable}\n"
+                f"  Frames encoded before this                      : "
                 f"{self.frames_successfully_encoded_so_far}"
             )
         output_packet.dts = output_packet.pts
