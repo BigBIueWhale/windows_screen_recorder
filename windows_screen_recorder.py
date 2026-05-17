@@ -2805,45 +2805,56 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             output_stream.time_base = Fraction(
                 1, TARGET_OUTPUT_FRAMES_PER_SECOND
             )
-            # Time-base of the libavcodec ``AVCodecContext``, which
+            # Time-base of the libavcodec ``AVCodecContext``. This
             # is a DIFFERENT field from ``AVStream.time_base`` and
-            # must be set independently. PyAV's
+            # must be set independently: PyAV's
             # ``stream.time_base = ...`` only writes the AVStream
-            # field; it does not propagate to the codec context.
+            # field, not the codec context's. Both fields control
+            # distinct legs of the encoded-MP4 timing arithmetic:
             #
-            # We force them equal here on purpose. The reason is
-            # FFmpeg's H.264 codec descriptor declares
-            # ``ticks_per_frame = 2`` (the legacy interlaced-fields
-            # convention from
-            # ``libavcodec/codec_desc.c::AV_CODEC_PROP_REORDER``-
-            # adjacent defaults), so if we leave
-            # ``avctx->time_base`` unset and only set
-            # ``avctx->framerate = TARGET_OUTPUT_FRAMES_PER_SECOND``
-            # via the ``rate`` argument to ``add_stream``, libavcodec
-            # picks a default of
-            # ``1 / (ticks_per_frame * framerate)`` =
-            # ``1 / (2 * TARGET_OUTPUT_FRAMES_PER_SECOND)`` =
-            # ``1 / 60`` for our target rate. PyAV then propagates
-            # that 1/60 onto every emitted output ``av.Packet`` via
-            # ``CodecContext._setup_encoded_packet`` line
-            # ``packet.ptr.time_base = self.ptr.time_base``. When
+            #   * ``stream.time_base`` is the unit in which the
+            #     output MP4 stores its per-track PTS values, after
+            #     libavformat's ``av_interleaved_write_frame``
+            #     rescales each muxed packet into this base.
+            #
+            #   * ``codec_context.time_base`` is the unit in which
+            #     libavcodec interprets the ``pts`` and ``dts``
+            #     fields on every emitted output ``av.Packet``. PyAV
+            #     stamps it onto each packet inside
+            #     ``CodecContext._setup_encoded_packet`` via
+            #     ``packet.ptr.time_base = self.ptr.time_base``.
+            #
+            # When the two disagree, ``av_interleaved_write_frame``
+            # rescales every muxed packet's PTS by the ratio between
+            # them - and the FIFO-popped synthesized PTS values that
             # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
-            # below overwrites ``output_packet.pts`` with the
-            # FIFO-popped value (computed by the capture worker in
-            # stream time-base units of
-            # ``1 / TARGET_OUTPUT_FRAMES_PER_SECOND`` seconds per
-            # unit, ie 1/30 for the default 30 fps target),
-            # ``output_container.mux(...)`` rescales it from the
-            # packet's 1/60 time-base into the stream's 1/30 time-
-            # base - halving the PTS value en route, halving the
-            # output MP4's playback duration, and surfacing as a
-            # 2x-faster-than-real-time playback to the operator.
+            # below writes onto ``output_packet.pts`` are computed
+            # by the capture worker in stream time-base units, so
+            # any rescale at mux time corrupts the output MP4's
+            # playback duration relative to the operator's real-
+            # time recording duration by exactly the disagreement
+            # ratio.
+            #
+            # Leaving ``codec_context.time_base`` unset on an H.264
+            # encoder is *not* equivalent to setting it equal to
+            # ``stream.time_base``: libavcodec's default for an
+            # H.264 codec context whose ``framerate`` is derived
+            # from the ``rate`` argument to ``add_stream`` is
+            # ``1 / (ticks_per_frame * framerate)``, with
+            # ``ticks_per_frame = 2`` from the H.264 codec
+            # descriptor's legacy interlaced-fields convention -
+            # i.e. ``1 / (2 * TARGET_OUTPUT_FRAMES_PER_SECOND)`` =
+            # ``1 / 60`` at the program's default 30 fps target,
+            # exactly *half* the stream time-base. The resulting
+            # half-ratio rescale at mux time would halve every PTS
+            # value en route to the MP4 and produce an output that
+            # plays back at exactly 2x real time.
             #
             # Setting ``codec_context.time_base`` equal to
-            # ``stream.time_base`` here eliminates that rescale by
-            # making it the identity transformation. The post-open
-            # validator below cross-checks that libavcodec did not
-            # silently override this value during ``avcodec_open2``.
+            # ``stream.time_base`` here makes the mux-time rescale
+            # the identity transformation. The post-open validator
+            # below cross-checks that libavcodec did not silently
+            # override this value during ``avcodec_open2``.
             output_stream.codec_context.time_base = Fraction(
                 1, TARGET_OUTPUT_FRAMES_PER_SECOND
             )
@@ -3176,11 +3187,14 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         ``qsvenc.c``'s sister file ``libavcodec/qsvdec.c`` lines
         64-70 explicitly checking for that exact sentinel on the
         decoder side. ``av_rescale_q(-1, ...)`` and
-        ``av_rescale_q(0, ...)`` both return 0, so PyAV surfaces
-        these broken packets as ``pkt.pts = 0`` - clobbering the
-        muxer's monotonic-DTS invariant and (before this method
-        existed) crashing the encoder worker with a strict-
-        monotonic-PTS watchdog rejection mid-recording.
+        ``av_rescale_q(0, ...)`` both return 0, so a libavcodec
+        consumer that trusts the value PyAV surfaces in
+        ``pkt.pts`` would see those broken packets as ``pkt.pts =
+        0`` mid-stream - clobbering the muxer's monotonic-DTS
+        invariant and producing either an EINVAL rejection at the
+        mp4 muxer's strict-monotonic-DTS guard or a silently
+        truncated output MP4. This method exists to ensure neither
+        outcome is reachable.
 
         Who is at fault, plainly: Intel. The
         ``mfxBitstream.TimeStamp`` field on output is supposed to
@@ -3693,22 +3707,21 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         # (8)-(9) Time-base agreement between the libavcodec
         # ``AVCodecContext`` and the libavformat ``AVStream``. Both
         # must equal ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``
-        # so that the FIFO-popped PTS values this program writes onto
-        # ``output_packet.pts`` in
+        # so that the FIFO-popped PTS values this program writes
+        # onto ``output_packet.pts`` in
         # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
-        # are NOT silently rescaled by libavformat's
-        # ``av_interleaved_write_frame`` on the way into the mp4
-        # muxer. If the codec context's time-base disagrees with the
-        # stream's time-base, the muxer rescales the packet's PTS by
-        # the ratio between them - which is the precise failure mode
-        # that surfaced as "output MP4 plays back at exactly 2x real
-        # time" on the reference target hardware before this check
-        # was added (FFmpeg defaulted ``codec_context.time_base`` to
-        # ``1 / (ticks_per_frame * framerate) = 1 / 60`` for an H.264
-        # codec descriptor with ``ticks_per_frame = 2`` and the
-        # ``framerate`` argument we pass into ``add_stream``, while
-        # ``stream.time_base`` was explicitly set to ``1 / 30``;
-        # every muxed PTS was halved on the way out).
+        # traverse ``av_interleaved_write_frame`` unchanged, and so
+        # the unit the output MP4 stores its per-track PTS values
+        # in is the same unit the capture worker computes those
+        # values in. Any disagreement is a non-identity rescale at
+        # mux time, and the output MP4 plays back faster or slower
+        # than the operator's real-time recording duration by
+        # exactly that ratio: see the long-form rationale at the
+        # ``codec_context.time_base`` assignment in
+        # ``_run_encode_loop`` above for the H.264-specific
+        # libavcodec default of ``1 / (ticks_per_frame * framerate)``
+        # and its 2x-faster-playback consequence on this program's
+        # 30 fps target rate.
         expected_time_base_in_stream_time_base_units = Fraction(
             1, TARGET_OUTPUT_FRAMES_PER_SECOND
         )
@@ -5334,11 +5347,15 @@ class _OperatorTkinterGui:
 
         self._construct_all_widgets()
 
-        # Allow the operator to resize the window. The minimum size is
-        # the natural requested size of the widget tree after layout -
-        # below that, ttk would clip labels or buttons, which was the
-        # exact failure mode the previous fixed-pixel layout exhibited
-        # under non-default Microsoft Windows display scaling.
+        # Allow the operator to resize the window. The minimum
+        # size is the natural requested size of the widget tree
+        # after layout - below that, ttk silently clips labels or
+        # buttons rather than reflowing them, which is the failure
+        # mode any fixed-pixel layout exhibits under non-default
+        # Microsoft Windows display scaling. The natural-requested
+        # ``minsize`` floor below ensures every ttk label and
+        # button stays fully visible at the smallest size the
+        # operator is allowed to drag the window down to.
         self._tk_root.resizable(True, True)
 
         # Force the layout to fully settle BEFORE we read winfo_reqheight
@@ -5411,11 +5428,11 @@ class _OperatorTkinterGui:
         #     ``TopLevelReqProc`` (in ``tkWinWm.c``) re-schedules
         #     ``UpdateGeometryInfo``, which now uses the *new*
         #     ``reqHeight`` and grows the toplevel accordingly. A
-        #     ``WxH+X+Y`` geometry call would have permanently
-        #     disabled this auto-grow, leaving the operator with a
-        #     window too small to show the longer status text - the
-        #     exact symptom previously observed after a recorder
-        #     fatal-error message inflates the status line.
+        #     ``WxH+X+Y`` geometry call would permanently disable
+        #     this auto-grow, leaving the operator with a window
+        #     too small to show the longer status text the moment
+        #     a recorder fatal-error message inflates the status
+        #     line.
         self._place_window_on_microsoft_windows_display_2(
             centering_estimated_window_width_pixels=(
                 natural_requested_window_width_pixels
@@ -5727,14 +5744,16 @@ class _OperatorTkinterGui:
     ) -> None:
         """Make ``label.wraplength`` track the label's current width.
 
-        Without this binding a ttk.Label with multi-line text refuses
-        to wrap dynamically: it keeps the wraplength it was given at
-        construction time, and any text wider than that wraplength
-        either clips or, if no wraplength was given, pushes the
-        containing window arbitrarily wide. (That second failure mode
-        is the runaway-horizontal-growth behaviour the previous fixed-
-        pixel layout exhibited at high Microsoft Windows display
-        scaling.)
+        Without this binding a ttk.Label with multi-line text
+        refuses to wrap dynamically: it keeps the wraplength it
+        was given at construction time, and any text wider than
+        that wraplength either clips or, if no wraplength was
+        given, pushes the containing window arbitrarily wide.
+        That second failure mode is the runaway-horizontal-growth
+        behaviour any fixed-pixel layout exhibits at high
+        Microsoft Windows display scaling, where the unbounded
+        natural width of a long status line can drive the toplevel
+        window wider than the entire Display 2 bounding rectangle.
 
         With this binding the label rewraps every time the operator
         drags the window edges - narrower text wraps to more lines,
