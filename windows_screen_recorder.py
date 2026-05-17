@@ -3501,9 +3501,34 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 )
 
         # Overwrite both PTS and DTS with the spec-correct
-        # synthesized value. PTS == DTS for a B-frame-free GOP per
-        # the H.264 specification; ``INTEL_QSV_MAX_B_FRAMES_VALUE``
-        # is what guarantees B-frame-free.
+        # synthesized value, and AT THE SAME TIME lock
+        # ``output_packet.time_base`` to the units that value is
+        # in (``1 / TARGET_OUTPUT_FRAMES_PER_SECOND``, the unit the
+        # capture worker computes its VFR wall-clock-anchored PTS
+        # values in, and the unit the FIFO carries them through
+        # unchanged). The libavformat mp4 muxer's per-packet
+        # rescale at ``av_interleaved_write_frame`` reads
+        # ``packet.time_base`` as the source time-base and
+        # ``stream.time_base`` as the destination, multiplying
+        # ``packet.pts`` by ``packet.time_base / stream.time_base``
+        # so that the same WALL-CLOCK INSTANT is preserved across
+        # the rescale. By pinning ``packet.time_base`` to our
+        # known units here, that rescale is wall-clock-preserving
+        # regardless of what value ``stream.time_base`` ends up at
+        # after the mp4 muxer's ``avformat_write_header`` runs on
+        # the first ``mux()`` call (the muxer is free to substitute
+        # a higher-precision per-track timescale at write_header
+        # time, and that happens AFTER the post-open validator runs
+        # and so cannot be cross-checked there; this pin is the
+        # downstream-invariant equivalent that holds across any
+        # such substitution).
+        #
+        # PTS == DTS for a B-frame-free GOP per the H.264
+        # specification; ``INTEL_QSV_MAX_B_FRAMES_VALUE`` is what
+        # guarantees B-frame-free.
+        output_packet.time_base = Fraction(
+            1, TARGET_OUTPUT_FRAMES_PER_SECOND
+        )
         output_packet.pts = (
             synthesized_pts_and_dts_in_stream_time_base_units
         )
