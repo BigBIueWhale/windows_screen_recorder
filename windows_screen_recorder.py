@@ -291,6 +291,71 @@ INTEL_QSV_LOOK_AHEAD_VALUE: Final[int] = 0
 # 3 frames at 30 fps = 100 ms end-to-end, which is irrelevant for a
 # screen recorder whose output is a video file (not a live stream).
 INTEL_QSV_ASYNC_DEPTH_VALUE: Final[int] = 4
+# Maximum B-frames between non-B-frames: 0 (no B-frames at all).
+#
+# We must set this EXPLICITLY because ``h264_qsv`` overrides FFmpeg's
+# generic AVCodecContext default. The generic libavcodec default for
+# ``bf`` (the AVOption that backs ``avctx->max_b_frames``) is 0, as
+# defined in
+# https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/options_table.h
+# (search for the ``"bf"`` entry; the ``DEFAULT`` macro it references
+# is ``#define DEFAULT 0`` earlier in that file). But the h264_qsv
+# encoder's per-codec defaults table at
+# https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/qsvenc_h264.c#L119
+# overrides that to ``-1`` (the "automatic / libmfx picks" sentinel):
+#
+#     static const FFCodecDefault qsv_enc_defaults[] = {
+#         { "b",  "1M"    },
+#         { "refs",  "0"  },
+#         { "g",  "250"   },
+#         { "bf", "-1"    },
+#         { NULL },
+#     };
+#
+# h264_qsv then computes
+#     ``q->param.mfx.GopRefDist = FFMAX(-1, avctx->max_b_frames) + 1;``
+# at https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavcodec/qsvenc.c#L1078,
+# so with the codec-default-overridden ``avctx->max_b_frames = -1``,
+# the result is ``GopRefDist = FFMAX(-1, -1) + 1 = 0``. ``GopRefDist = 0``
+# is libmfx's "the runtime picks" sentinel, and on Intel UHD Graphics 770
+# (13th-gen Core i7-13700, the reference target hardware for this program)
+# the vpl-gpu-rt runtime picks ``GopRefDist = 3`` (i.e. ``bf = 2`` B-frames
+# between anchors). The encoder then emits packets in decode order, not
+# display order, producing the empirically observed output PTS sequence
+#
+#     I(pts=0, dts=-1)  P(pts=3, dts=0)  B(pts=1, dts=1)
+#     B(pts=2, dts=2)   P(pts=6, dts=3)  B(pts=4, dts=4)  B(pts=5, dts=5)
+#     ...
+#
+# which is the classic ``bf=2`` GOP pattern in decode order. The
+# strict-monotonic-PTS watchdog in
+# ``_mux_one_encoded_packet_with_dts_forced_to_pts`` correctly rejects
+# this on the third output packet (``pts=1 <= previously_muxed_pts=3``).
+#
+# Setting ``bf = 0`` explicitly forces
+# ``GopRefDist = FFMAX(-1, 0) + 1 = 1`` (i.e. no B-frames between
+# anchors). This is REQUIRED for two correctness invariants this
+# program depends on:
+#
+#   1. The ``pkt.dts := pkt.pts`` override in the mux helper is
+#      spec-correct ONLY when there are no B-frames. With B-frames,
+#      DTS < PTS for some packets by the H.264 specification, and
+#      overwriting DTS with PTS would corrupt the decode timing.
+#
+#   2. The strict-monotonic-output-PTS watchdog assumes encode order
+#      equals display order (no reordering). With B-frames, encode
+#      order does not equal display order, so PTS comes out non-
+#      monotonic by design.
+#
+# Both invariants are local Python-side defensive checks. Disabling
+# B-frames here makes them tractable; allowing B-frames would require
+# threading a full PTS/DTS reordering buffer through the mux helper,
+# which has no compelling benefit for this program's content (a
+# Microsoft Windows desktop capture is mostly static text plus
+# occasional motion; the compression efficiency gain from B-frames
+# at quality target 22 is typically under 5%, and is irrelevant for a
+# screen recorder writing to local NTFS).
+INTEL_QSV_MAX_B_FRAMES_VALUE: Final[int] = 0
 # Keyframe interval expressed in frames. We choose 2 wall-clock seconds, so
 # the value is 2 * frame rate. This bounds the lost-on-crash tail to about
 # 2 seconds (the most recently-started fragment).
@@ -2309,6 +2374,16 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 "look_ahead": str(INTEL_QSV_LOOK_AHEAD_VALUE),
                 "g": str(KEYFRAME_INTERVAL_FRAMES),
                 "async_depth": str(INTEL_QSV_ASYNC_DEPTH_VALUE),
+                # Force B-frames OFF: see the long-form rationale at the
+                # ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant. Without
+                # this, h264_qsv inherits its per-codec-default ``bf=-1``
+                # (libmfx picks), libmfx picks ``GopRefDist=3`` on
+                # Intel UHD Graphics 770, and the encoder emits packets
+                # in decode order (eg ``I0,P3,B1,B2,P6,...``) which
+                # violates both the ``pkt.dts := pkt.pts`` override and
+                # the strict-monotonic-PTS watchdog in
+                # ``_mux_one_encoded_packet_with_dts_forced_to_pts``.
+                "bf": str(INTEL_QSV_MAX_B_FRAMES_VALUE),
             }
 
             while True:
@@ -3770,6 +3845,7 @@ class RecordingSessionController:
                 "qsv_preset": INTEL_QSV_PRESET_VALUE,
                 "qsv_look_ahead": INTEL_QSV_LOOK_AHEAD_VALUE,
                 "qsv_async_depth": INTEL_QSV_ASYNC_DEPTH_VALUE,
+                "qsv_max_b_frames": INTEL_QSV_MAX_B_FRAMES_VALUE,
                 "target_output_frames_per_second": (
                     TARGET_OUTPUT_FRAMES_PER_SECOND
                 ),
