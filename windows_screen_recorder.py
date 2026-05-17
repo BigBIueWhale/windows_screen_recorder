@@ -2186,6 +2186,17 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         self.frames_discarded_due_to_force_cancel_so_far: int = 0
         self.encoder_was_force_cancelled: bool = False
 
+        # Monotonicity watchdog for the libmfx-DecodeTimeStamp workaround
+        # in ``_mux_one_encoded_packet_with_dts_forced_to_pts``. Tracks
+        # the ``pts`` (in the output stream's time-base units) of the
+        # most recently muxed packet, used to assert that h264_qsv is
+        # producing strictly increasing PTS values for the strictly
+        # increasing input-frame PTS sequence we feed it. Initially
+        # ``None`` because no packet has been muxed yet.
+        self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units: Optional[
+            int
+        ] = None
+
     def run(self) -> None:
         try:
             self._run_encode_loop()
@@ -2313,7 +2324,10 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                     for output_packet in output_stream.encode(
                         av_nv12_video_frame
                     ):
-                        output_container.mux(output_packet)
+                        self._mux_one_encoded_packet_with_dts_forced_to_pts(
+                            output_packet=output_packet,
+                            output_container=output_container,
+                        )
                 except av.FFmpegError as ffmpeg_err:
                     raise EncoderPipelineError(
                         _format_encoder_pipeline_error_message_from_ffmpeg_error(
@@ -2363,7 +2377,10 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             if not self.encoder_was_force_cancelled:
                 try:
                     for trailing_packet in output_stream.encode(None):
-                        output_container.mux(trailing_packet)
+                        self._mux_one_encoded_packet_with_dts_forced_to_pts(
+                            output_packet=trailing_packet,
+                            output_container=output_container,
+                        )
                 except av.FFmpegError as ffmpeg_err:
                     raise EncoderPipelineError(
                         _format_encoder_pipeline_error_message_from_ffmpeg_error(
@@ -2407,6 +2424,114 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             f"{self.frames_discarded_due_to_force_cancel_so_far}. "
             f"Force-cancelled: {self.encoder_was_force_cancelled}."
         )
+
+    def _mux_one_encoded_packet_with_dts_forced_to_pts(
+        self,
+        *,
+        output_packet: "av.Packet",
+        output_container: "av.container.OutputContainer",
+    ) -> None:
+        """Mux one h264_qsv-produced packet after forcing ``dts := pts``.
+
+        Works around the documented libmfx behaviour that causes the
+        mp4 muxer's strict-monotonic-DTS guard
+        (``libavformat/mux.c::compute_muxer_pkt_fields`` lines 557-573)
+        to reject the Nth output packet with ``AVERROR(EINVAL)`` shortly
+        after the libmfx encode pipeline starts producing real output:
+        the libmfx ``mfxBitstream.DecodeTimeStamp`` field is observed
+        non-monotonically during pipeline fill (see
+        https://github.com/Intel-Media-SDK/MediaSDK/issues/978 - libmfx
+        emits DTS sequences such as ``0, -2, -1, 0, 4, 2, 1, 3``), and
+        h264_qsv rescales those values to the codec context's
+        time-base via
+        ``av_rescale_q(qpkt.bs->DecodeTimeStamp, {1,90000}, avctx->time_base)``
+        in ``libavcodec/qsvenc.c`` line ~2666, then writes the result
+        directly into ``packet.dts``. The first two or three packets
+        come out with synthetic / sentinel DTS that the rescale maps
+        to one set of values; the fourth packet (the one that
+        produced the user-visible ``"-512 >= -1536"`` rejection in
+        our environment) is the first to carry a "real"
+        ``DecodeTimeStamp`` whose rescale lands *below* the
+        previously-muxed DTS.
+
+        The unambiguous correct DTS in our pipeline is ``packet.pts``:
+        we force ``GopRefDist = FFMAX(max_b_frames, 0) + 1 = 1``
+        (``libavcodec/qsvenc.c`` line 815, with the FFmpeg default
+        ``max_b_frames = 0``), which produces a B-frame-free
+        ``IPPPP...`` H.264 GOP structure. The H.264 specification
+        defines DTS == PTS for every packet in a B-frame-free
+        bitstream (decode order is identical to display order, since
+        there is no out-of-order reference frame to wait for).
+        Overwriting libmfx's broken ``DecodeTimeStamp`` with the
+        encoder's own ``packet.pts`` is therefore the spec-correct
+        value, not a heuristic.
+
+        Defensive invariants enforced (each violation is a loud
+        ``EncoderPipelineError`` - no silent fallback):
+
+        1. ``output_packet.pts`` must be a real integer, not None
+           (``AV_NOPTS_VALUE``). If h264_qsv ever returns a packet
+           without a PTS it is a contract violation; we refuse to
+           guess a value and refuse to mux it with a None DTS.
+
+        2. ``output_packet.pts`` must be strictly greater than the
+           previously muxed packet's ``pts``. We feed h264_qsv with
+           strictly increasing input-frame PTS values, and a
+           B-frame-free encoder must emit packets in input order with
+           strictly increasing output PTS. A violation here would
+           signal either a libmfx bug we cannot work around or an
+           unexpected B-frame leaking into the GOP.
+        """
+        if output_packet.pts is None:
+            raise EncoderPipelineError(
+                f"h264_qsv produced an output packet with "
+                f"packet.pts == AV_NOPTS_VALUE (None). The recorder "
+                f"feeds the encoder with strictly increasing integer "
+                f"PTS values via "
+                f"``av.VideoFrame.pts = "
+                f"presentation_timestamp_in_one_frame_units``, so "
+                f"every output packet must carry a real PTS. A None "
+                f"PTS at this point indicates an h264_qsv / libmfx "
+                f"contract violation that this program does not "
+                f"silently paper over.\n"
+                f"  Frames successfully encoded before this packet : "
+                f"{self.frames_successfully_encoded_so_far}\n"
+                f"  Most recently muxed packet PTS                  : "
+                f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}"
+            )
+        previously_muxed_pts = (
+            self
+            ._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units
+        )
+        if (
+            previously_muxed_pts is not None
+            and output_packet.pts <= previously_muxed_pts
+        ):
+            raise EncoderPipelineError(
+                f"h264_qsv produced an output packet whose "
+                f"packet.pts is not strictly greater than the "
+                f"previously muxed packet's PTS. The encoder is "
+                f"configured with GopRefDist=1 (no B-frames), so "
+                f"emitted packets must follow input order with "
+                f"strictly increasing PTS. A violation here means "
+                f"either a libmfx defect this program cannot work "
+                f"around, or an unexpected reordering somewhere in "
+                f"the encode pipeline; either way we refuse to mux "
+                f"a non-monotonic packet because the mp4 muxer "
+                f"would reject it anyway with "
+                f"``AVERROR(EINVAL)``.\n"
+                f"  Previously muxed packet PTS : "
+                f"{previously_muxed_pts}\n"
+                f"  Current packet PTS          : "
+                f"{output_packet.pts}\n"
+                f"  Frames encoded before this  : "
+                f"{self.frames_successfully_encoded_so_far}"
+            )
+        output_packet.dts = output_packet.pts
+        self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units = (
+            output_packet.pts
+        )
+        output_container.mux(output_packet)
 
     def _discard_queue_remainder_due_to_force_cancel(self) -> None:
         """Drain whatever is still in the inbound queue, counting the loss."""
