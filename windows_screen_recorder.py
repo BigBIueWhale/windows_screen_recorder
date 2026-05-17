@@ -279,11 +279,12 @@ INTEL_QSV_LOOK_AHEAD_VALUE: Final[int] = 0
 # sister file ``libavcodec/qsvdec.c`` lines 64-70. FFmpeg's mp4 muxer
 # would then reject the second output packet that surfaces with
 # ``pkt.pts = 0`` via the strict-monotonic-DTS guard at
-# ``libavformat/mux.c`` lines 410-420; the strict-monotonic-PTS
-# watchdog in this program's
-# ``_mux_one_encoded_packet_with_dts_forced_to_pts`` catches the same
-# class of defect one stack frame earlier, with richer Python-side
-# context. Intel's own libvpl sample encoder never combines
+# ``libavformat/mux.c`` lines 410-420. This program does not rely on
+# the mp4 muxer catching that defect: every output packet's PTS and
+# DTS are synthesized from a strictly-monotonic counter inside
+# ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``, so the
+# defect surfaces only as a forensic ``WARNING`` line in
+# ``session.log`` rather than as a fatal muxer rejection. Intel's own libvpl sample encoder never combines
 # AsyncDepth=1 with ICQ - the only modes Intel forces AsyncDepth=1
 # in are TCBRC and PartialOutput, neither of which this program uses.
 # The defect class is documented in
@@ -333,12 +334,14 @@ INTEL_QSV_ASYNC_DEPTH_VALUE: Final[int] = 4
 #     B(pts=2, dts=2)   P(pts=6, dts=3)  B(pts=4, dts=4)  B(pts=5, dts=5)
 #     ...
 #
-# - the classic ``bf=2`` GOP pattern in decode order. The strict-
-# monotonic-output-PTS watchdog in
-# ``_mux_one_encoded_packet_with_dts_forced_to_pts`` is the in-program
-# guarantee that this pattern would be rejected loudly rather than
-# muxed silently; this constant is the in-program guarantee that the
-# pattern never reaches the watchdog in the first place.
+# - the classic ``bf=2`` GOP pattern in decode order. This constant
+# is the in-program guarantee that the pattern never reaches the
+# encoder output in the first place: ``GopRefDist == 1`` forbids
+# the Intel oneVPL runtime from emitting B-frames at all, which is
+# the foundational invariant that makes the PTS/DTS synthesis in
+# ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+# spec-correct (decode order equals display order equals input
+# order, so the Nth output packet's spec-correct timestamp is N).
 #
 # Setting ``bf = 0`` explicitly forces
 # ``GopRefDist = FFMAX(-1, 0) + 1 = 1`` (i.e. no B-frames between
@@ -2245,6 +2248,38 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 # value, AND verify that the value actually made it through every
 # layer that can observe it. We assume nothing about defaults at any
 # layer.
+#
+# Two things this configuration-locking strategy CANNOT cover:
+#
+#   (a) The Intel oneVPL runtime's H.264 hardware-encode
+#       implementation (the ``intel/vpl-gpu-rt`` project, layer 5)
+#       silently fails to populate ``mfxBitstream.TimeStamp`` on a
+#       non-deterministic subset of its output packets. FFmpeg's
+#       ``libavcodec/qsvenc.c`` line 2667 then maps the resulting
+#       sentinel / uninitialised value to ``pkt.pts = 0`` without
+#       sanitisation, despite the sister file ``qsvdec.c`` lines
+#       64-70 sanitising the same sentinel correctly on the decoder
+#       side. This is an Intel bug compounded by an FFmpeg bug;
+#       neither has been fixed at the time of writing. The encoder
+#       worker therefore SYNTHESIZES every output packet's ``pts``
+#       and ``dts`` from a strictly-monotonic per-packet counter
+#       in ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+#       below, ignoring the libmfx-derived values entirely. The
+#       synthesized values are spec-correct under invariant (i) of
+#       the encoder worker class docstring.
+#
+#   (b) The Intel oneVPL runtime might theoretically also drop or
+#       duplicate output packets (i.e. break the 1:1
+#       input-frame-to-output-bitstream correspondence that
+#       ``GopRefDist=1`` is supposed to guarantee). The synthesis in
+#       (a) RELIES on that 1:1 correspondence to map the Nth output
+#       packet to input-frame-index N. If the runtime were to break
+#       it too, the synthesized PTS values would be correct integers
+#       but would label the wrong content - the resulting MP4 would
+#       play back with a one-frame displacement somewhere. We have
+#       no defence against this from inside the encoder worker
+#       without parsing the H.264 bitstream and cross-referencing
+#       frame counts; we choose not to.
 
 
 def _format_encoder_pipeline_error_message_from_ffmpeg_error(
@@ -2334,9 +2369,10 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
     PyAV stream and consumes encoded packets from it inside a single
     Microsoft Windows kernel thread.
 
-    Three correctness invariants the worker imposes on the encoded
+    Two correctness invariants the worker imposes on the encoded
     H.264 bitstream, each enforced by an explicit mechanism rather
-    than left to FFmpeg's / Intel oneVPL's default behaviour:
+    than left to FFmpeg's or the Intel oneVPL runtime's default
+    behaviour:
 
     (i)  The output GOP is B-frame-free. The constant
          ``INTEL_QSV_MAX_B_FRAMES_VALUE = 0`` (Section 2) is passed
@@ -2344,30 +2380,38 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
          options dict; ``avcodec_open2`` then computes the libmfx
          GOP-reference-distance parameter as
          ``q->param.mfx.GopRefDist = FFMAX(-1, 0) + 1 = 1``, which
-         the Intel oneVPL runtime interprets as "no B-frames between
-         anchors". The
+         the Intel oneVPL runtime is contractually obliged to
+         interpret as "no B-frames between anchors". The
          ``_verify_encoder_codec_context_post_open_state_matches_explicit_configuration``
          validator reads ``codec_context.max_b_frames`` back after
-         open() and refuses to proceed if FFmpeg or the Intel
-         oneVPL runtime silently coerced it.
+         ``open()`` and refuses to proceed if FFmpeg or the Intel
+         oneVPL runtime silently coerced it. With no B-frames in
+         the output bitstream, the H.264 specification mandates
+         decode order == display order == input order.
 
-    (ii) Each output packet's decode timestamp is set equal to its
-         presentation timestamp, in
-         ``_mux_one_encoded_packet_with_dts_forced_to_pts``. For a
-         B-frame-free H.264 bitstream this is the H.264-spec-correct
-         value by construction (decode order equals display order in
-         a B-frame-free GOP), independent of whatever values the
-         Intel oneVPL runtime's ``mfxBitstream.DecodeTimeStamp``
-         field carries during pipeline fill.
-
-    (iii) Output packets are muxed in strictly-increasing PTS order.
-          The same mux helper refuses to mux any packet whose PTS is
-          not strictly greater than the previously muxed packet's
-          PTS. Strictly redundant with FFmpeg's mp4 muxer's own
-          monotonic-DTS guard at ``libavformat/mux.c`` lines 410-420,
-          but enforced one stack frame earlier so the failure
-          carries this program's diagnostic context rather than a
-          bare libav ``AVERROR(EINVAL)``.
+    (ii) Each output packet's ``pts`` and ``dts`` are SYNTHESIZED
+         from a strictly-monotonic per-packet counter inside
+         ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``,
+         and the libmfx-derived ``mfxBitstream.TimeStamp`` and
+         ``mfxBitstream.DecodeTimeStamp`` values that FFmpeg's
+         ``h264_qsv`` wrapper writes onto ``av.Packet`` are
+         discarded. This program does not get to trust those
+         libmfx-derived values, because Intel's ``vpl-gpu-rt``
+         H.264 hardware-encode implementation silently fails to
+         populate ``mfxBitstream.TimeStamp`` on a non-deterministic
+         subset of its output packets - and FFmpeg's
+         ``libavcodec/qsvenc.c`` line 2667 maps the resulting
+         sentinel / zero straight through to ``pkt.pts = 0`` with
+         no sanitisation. The synthesized counter value is the
+         H.264-spec-correct ``pts`` and ``dts`` for the Nth output
+         packet under invariant (i): the long-form derivation is in
+         the docstring of
+         ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``.
+         Every disagreement between the libmfx-derived value and
+         the synthesized value is logged at WARNING into
+         ``session.log`` so the magnitude and frequency of the
+         Intel oneVPL runtime's ``mfxBitstream.TimeStamp`` defect
+         on the running hardware remains forensically observable.
 
     The worker honours two distinct stop signals:
 
@@ -2421,16 +2465,23 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         self.frames_discarded_due_to_force_cancel_so_far: int = 0
         self.encoder_was_force_cancelled: bool = False
 
-        # Monotonicity watchdog for the libmfx-DecodeTimeStamp workaround
-        # in ``_mux_one_encoded_packet_with_dts_forced_to_pts``. Tracks
-        # the ``pts`` (in the output stream's time-base units) of the
-        # most recently muxed packet, used to assert that h264_qsv is
-        # producing strictly increasing PTS values for the strictly
-        # increasing input-frame PTS sequence we feed it. Initially
-        # ``None`` because no packet has been muxed yet.
-        self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units: Optional[
-            int
-        ] = None
+        # Strictly-monotonic counter from which the encoder worker
+        # synthesizes every output ``av.Packet``'s ``pts`` and ``dts``
+        # in stream time-base units, in
+        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``.
+        # Starts at 0 and increments by exactly 1 per muxed packet.
+        # This program deliberately does NOT trust the ``pkt.pts`` and
+        # ``pkt.dts`` values that surface out of FFmpeg's ``h264_qsv``
+        # encoder wrapper, because Intel's ``vpl-gpu-rt`` H.264
+        # hardware-encode implementation (the Intel-shipped
+        # implementation of the Intel oneVPL runtime, distributed with
+        # the Intel Graphics driver) silently fails to populate
+        # ``mfxBitstream.TimeStamp`` on a non-deterministic subset of
+        # its output packets. See the long-form rationale on the
+        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+        # method below for why the synthesized values are
+        # spec-correct under this program's encoder configuration.
+        self._next_synthesized_output_packet_pts_in_stream_time_base_units: int = 0
 
     def run(self) -> None:
         try:
@@ -2511,14 +2562,15 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                 "look_ahead": str(INTEL_QSV_LOOK_AHEAD_VALUE),
                 "g": str(KEYFRAME_INTERVAL_FRAMES),
                 "async_depth": str(INTEL_QSV_ASYNC_DEPTH_VALUE),
-                # Force B-frames OFF; see the long-form rationale at the
-                # ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant declaration in
-                # Section 2. Encoded packets must come out of FFmpeg's
-                # ``h264_qsv`` wrapper in input order so that the
-                # ``pkt.dts := pkt.pts`` override and the strict-
-                # monotonic-PTS watchdog in
-                # ``_mux_one_encoded_packet_with_dts_forced_to_pts``
-                # are spec-correct rather than approximations.
+                # Force B-frames OFF; see the long-form rationale at
+                # the ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant
+                # declaration in Section 2. Encoded packets must come
+                # out of FFmpeg's ``h264_qsv`` wrapper in input order
+                # so that the PTS/DTS synthesis in
+                # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+                # is spec-correct (decode order == display order ==
+                # input order, so the Nth output packet's
+                # spec-correct timestamp is N).
                 "bf": str(INTEL_QSV_MAX_B_FRAMES_VALUE),
             }
 
@@ -2625,7 +2677,7 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
                     for output_packet in output_stream.encode(
                         av_nv12_video_frame
                     ):
-                        self._mux_one_encoded_packet_with_dts_forced_to_pts(
+                        self._mux_one_encoded_packet_with_synthesized_pts_and_dts(
                             output_packet=output_packet,
                             output_container=output_container,
                         )
@@ -2678,7 +2730,7 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             if not self.encoder_was_force_cancelled:
                 try:
                     for trailing_packet in output_stream.encode(None):
-                        self._mux_one_encoded_packet_with_dts_forced_to_pts(
+                        self._mux_one_encoded_packet_with_synthesized_pts_and_dts(
                             output_packet=trailing_packet,
                             output_container=output_container,
                         )
@@ -2726,233 +2778,247 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
             f"Force-cancelled: {self.encoder_was_force_cancelled}."
         )
 
-    def _mux_one_encoded_packet_with_dts_forced_to_pts(
+    def _mux_one_encoded_packet_with_synthesized_pts_and_dts(
         self,
         *,
         output_packet: "av.Packet",
         output_container: "av.container.OutputContainer",
     ) -> None:
-        """Mux one h264_qsv-produced packet after forcing ``dts := pts``.
+        """Mux one ``h264_qsv``-produced packet after overwriting Intel's PTS and DTS with synthesized values.
 
-        Works around the documented libmfx behaviour that causes the
-        mp4 muxer's strict-monotonic-DTS guard
-        (``libavformat/mux.c::compute_muxer_pkt_fields`` lines 557-573)
-        to reject the Nth output packet with ``AVERROR(EINVAL)`` shortly
-        after the libmfx encode pipeline starts producing real output:
-        the libmfx ``mfxBitstream.DecodeTimeStamp`` field is observed
-        non-monotonically during pipeline fill (see
-        https://github.com/Intel-Media-SDK/MediaSDK/issues/978 - libmfx
-        emits DTS sequences such as ``0, -2, -1, 0, 4, 2, 1, 3``), and
-        h264_qsv rescales those values to the codec context's
-        time-base via
-        ``av_rescale_q(qpkt.bs->DecodeTimeStamp, {1,90000}, avctx->time_base)``
-        in ``libavcodec/qsvenc.c`` line ~2666, then writes the result
-        directly into ``packet.dts``. The first two or three packets
-        come out with synthetic / sentinel DTS that the rescale maps
-        to one set of values; the fourth packet (the one that
-        produced the user-visible ``"-512 >= -1536"`` rejection in
-        our environment) is the first to carry a "real"
-        ``DecodeTimeStamp`` whose rescale lands *below* the
-        previously-muxed DTS.
+        Why we synthesize, instead of using the encoder's own
+        timestamps - the short version:
 
-        The unambiguous correct DTS in our pipeline is ``packet.pts``:
-        we force ``GopRefDist = FFMAX(max_b_frames, 0) + 1 = 1``
-        (``libavcodec/qsvenc.c`` line 815, with the FFmpeg default
-        ``max_b_frames = 0``), which produces a B-frame-free
-        ``IPPPP...`` H.264 GOP structure. The H.264 specification
-        defines DTS == PTS for every packet in a B-frame-free
-        bitstream (decode order is identical to display order, since
-        there is no out-of-order reference frame to wait for).
-        Overwriting libmfx's broken ``DecodeTimeStamp`` with the
-        encoder's own ``packet.pts`` is therefore the spec-correct
-        value, not a heuristic.
+        Intel's ``intel/vpl-gpu-rt`` runtime - the H.264 hardware
+        encoder implementation that backs the Intel oneVPL runtime
+        on Microsoft Windows hosts with an Intel iGPU, distributed
+        by Intel as part of the Intel Graphics driver - silently
+        fails to populate ``mfxBitstream.TimeStamp`` on a
+        non-deterministic subset of its output packets. On the
+        reference target hardware (the integrated Intel UHD
+        Graphics 770 GPU on the 13th-generation Intel Core i7-13700
+        desktop processor) with this program's
+        ``MFX_RATECONTROL_ICQ + AsyncDepth=4 + GopRefDist=1``
+        configuration, that defect surfaces empirically from the
+        6th output packet onward: the Intel runtime returns a
+        bitstream whose ``mfxBitstream.TimeStamp`` field is either
+        the ``MFX_TIMESTAMP_UNKNOWN = -1`` sentinel or the
+        ``av_mallocz``-zeroed initial value, *despite* having
+        received a perfectly valid input ``Data.TimeStamp`` for the
+        corresponding input frame.
 
-        Defensive invariants enforced (each violation is a loud
-        ``EncoderPipelineError`` - no silent fallback):
+        FFmpeg's ``libavcodec/qsvenc.c`` line 2667 then translates
+        the broken value straight through with::
 
-        1. ``output_packet.pts`` must be a real integer, not None
-           (``AV_NOPTS_VALUE``). If h264_qsv ever returns a packet
-           without a PTS it is a contract violation; we refuse to
-           guess a value and refuse to mux it with a None DTS.
+            qpkt.pkt.pts = av_rescale_q(qpkt.bs->TimeStamp,
+                                         (AVRational){1, 90000},
+                                         avctx->time_base);
 
-        2. ``output_packet.pts`` must be strictly greater than the
-           previously muxed packet's ``pts``. We feed h264_qsv with
-           strictly increasing input-frame PTS values, and a
-           B-frame-free encoder must emit packets in input order
-           with strictly increasing output PTS.
+        with no ``MFX_TIMESTAMP_UNKNOWN`` sanitisation - despite
+        ``qsvenc.c``'s sister file ``libavcodec/qsvdec.c`` lines
+        64-70 explicitly checking for that exact sentinel on the
+        decoder side. ``av_rescale_q(-1, ...)`` and
+        ``av_rescale_q(0, ...)`` both return 0, so PyAV surfaces
+        these broken packets as ``pkt.pts = 0`` - clobbering the
+        muxer's monotonic-DTS invariant and (before this method
+        existed) crashing the encoder worker with a strict-
+        monotonic-PTS watchdog rejection mid-recording.
 
-           This invariant is, strictly speaking, redundant - with
-           the ``pkt.dts := pkt.pts`` override applied just below,
-           FFmpeg's mp4 muxer already enforces the same constraint
-           one stack-frame down, at
-           ``libavformat/mux.c::compute_muxer_pkt_fields`` lines
-           410-420 of FFmpeg 8.0.1 (the exact FFmpeg release that
-           PyAV 17.0.1 statically links via the ``pyav-ffmpeg``
-           release tag ``8.0.1-5``). The relevant block, copied
-           verbatim from
-           https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/mux.c#L410-L420
+        Who is at fault, plainly: Intel. The
+        ``mfxBitstream.TimeStamp`` field on output is supposed to
+        carry through the input ``Data.TimeStamp``; the AV1 path in
+        ``intel/vpl-gpu-rt`` does this correctly at
+        ``av1ehw_base_general.cpp`` line 1663
+        (``task.pBsOut->TimeStamp = task.pSurfIn->Data.TimeStamp;``);
+        the H.264 path does not, on this hardware, under our
+        configuration. FFmpeg's ``qsvenc.c`` is a secondary
+        accomplice for not sanitising the sentinel the way
+        ``qsvdec.c`` does, but the upstream cause is Intel's H.264
+        encode pipeline failing to honour its own documented
+        ``mfxBitstream.TimeStamp`` contract. Neither bug has been
+        fixed at the time of writing; every screen recorder that
+        hands H.264 work to ``h264_qsv`` on this Intel Graphics
+        driver inherits the defect.
 
-               if (sti->cur_dts && sti->cur_dts != AV_NOPTS_VALUE &&
-                   ((!(s->oformat->flags & AVFMT_TS_NONSTRICT) &&
-                     st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
-                     st->codecpar->codec_type != AVMEDIA_TYPE_DATA &&
-                     sti->cur_dts >= pkt->dts) || sti->cur_dts > pkt->dts)) {
-                   av_log(s, AV_LOG_ERROR,
-                          "Application provided invalid, non monotonically "
-                          "increasing dts to muxer in stream %d: %s >= %s\n",
-                          st->index, av_ts2str(sti->cur_dts),
-                          av_ts2str(pkt->dts));
-                   return AVERROR(EINVAL);
-               }
+        This program does not have the option of waiting for
+        Intel.
 
-           The mp4 muxer does NOT set ``AVFMT_TS_NONSTRICT``: see
-           ``ff_mp4_muxer.p.flags = AVFMT_GLOBALHEADER |
-           AVFMT_TS_NEGATIVE | AVFMT_VARIABLE_FPS`` at
-           ``libavformat/movenc.c`` line 8939 of FFmpeg 8.0.1
-           (https://github.com/FFmpeg/FFmpeg/blob/n8.0.1/libavformat/movenc.c#L8939).
-           So equality is rejected too - identical semantics to
-           the ``<=`` we apply here.
+        What this method does instead:
 
-           We assume nothing about that downstream check remaining
-           in place across future FFmpeg releases - it could be
-           weakened by an upstream patch, or PyAV 18 could repin
-           against an FFmpeg version that changes the contract -
-           and we assume nothing about whether the libmfx /
-           ``vpl-gpu-rt`` H.264 path might surface duplicate-PTS
-           packets again under some other AsyncDepth /
-           RateControlMethod combination. So we enforce the
-           invariant ourselves in Python, before the mux call,
-           for three concrete reasons:
+        It discards ``output_packet.pts`` and ``output_packet.dts``
+        entirely - the values Intel's runtime put there via
+        ``mfxBitstream.TimeStamp`` and ``mfxBitstream.DecodeTimeStamp``
+        - and substitutes a strictly-monotonic integer counter
+        (``_next_synthesized_output_packet_pts_in_stream_time_base_units``,
+        initialised to 0 in ``__init__``, incremented by exactly 1
+        per muxed packet). The substituted value is then assigned
+        to both ``output_packet.pts`` and ``output_packet.dts``.
 
-           (a) the failure surfaces earlier in the call chain -
-               the traceback points at the encoder worker rather
-               than at ``output_container.mux(output_packet)``;
-           (b) the Python-side error message carries diagnostic
-               context that the libav ``ArgumentError`` does not -
-               the raw pre-override DTS, the packet flags, the
-               running input-frame counter, and a pointer at the
-               specific ``qsvenc.c`` defect class that produces
-               this defect class;
-           (c) the program's correctness does not silently depend
-               on a libavformat invariant remaining in place;
-               asserting it locally turns "could not have
-               happened" into "would loudly fail if it ever did
-               happen".
+        The substituted value is the *spec-correct* PTS and DTS
+        for this program's encoder configuration. The chain of
+        reasoning, every link explicit:
 
-           This is defense in depth, not paranoia, and the
-           assumption ledger above is the entire justification.
-           A violation here would signal either a libmfx defect
-           this program cannot work around or an unexpected
-           B-frame leaking into the GOP.
+          1. ``INTEL_QSV_MAX_B_FRAMES_VALUE = 0`` is set explicitly
+             in the codec context's ``options`` dict in
+             ``_run_encode_loop`` and verified post-open by
+             ``_verify_encoder_codec_context_post_open_state_matches_explicit_configuration``.
+             This means ``avctx->max_b_frames == 0`` after
+             ``avcodec_open2`` returns, which in turn means
+             ``q->param.mfx.GopRefDist == FFMAX(-1, 0) + 1 == 1``
+             when ``libavcodec/qsvenc.c`` line 1078 passes the
+             parameter into the Intel oneVPL session
+             initialisation via ``MFXVideoENCODE_Init``.
+             ``GopRefDist == 1`` is libmfx's explicit instruction
+             for "no B-frames between anchors".
+
+          2. With no B-frames, the H.264 specification's encoded
+             bitstream has decode order identical to display order:
+             each output NAL unit is a single picture, encoded
+             with reference only to past pictures, decodable as
+             soon as it arrives. The Nth output packet (in the
+             order ``output_container.mux`` receives it)
+             corresponds to the Nth input frame this program fed
+             into ``output_stream.encode``.
+
+          3. The capture worker submits input frames carrying
+             strictly-monotonic integer ``av.VideoFrame.pts``
+             values 0, 1, 2, ... in the stream time-base, via
+             ``av_nv12_video_frame.pts = N`` in ``_run_encode_loop``
+             above. The Nth input frame therefore has
+             ``av.VideoFrame.pts == N``.
+
+          4. Combining (2) and (3): the Nth output packet's
+             spec-correct ``pkt.pts`` is N. A counter that starts
+             at 0 and increments by exactly 1 per output packet
+             produces exactly that value.
+
+          5. With no B-frames, the H.264 specification mandates
+             ``DTS == PTS`` for every packet (no out-of-order
+             reference frame ever has to be waited on). So the
+             same counter value is the spec-correct ``pkt.dts``.
+
+        That is the entire justification. There is no heuristic,
+        no fudge, no "good enough"; under the four numbered
+        invariants above the synthesized value is uniquely correct.
+
+        The hopeful step in this chain is link (2)'s
+        ``"the Nth output packet corresponds to the Nth input
+        frame"`` premise. We rely on it. It is what the H.264
+        ``GopRefDist=1`` configuration guarantees - in the spec.
+        We have to hope Intel's ``vpl-gpu-rt`` runtime, which has
+        already proven it does not honour the
+        ``mfxBitstream.TimeStamp`` contract, does at least honour
+        the ``one input frame produces exactly one output
+        bitstream`` contract on top of which (2) rests. If the
+        runtime were to silently drop or duplicate an output
+        bitstream - say, the encoder internally short-circuiting
+        a low-delta frame and not emitting any packet for it -
+        the counter on the Nth output would no longer name the
+        Nth input frame, and the resulting MP4 would play back
+        with content displaced by one frame from where it should
+        be, with no diagnostic to surface that. We cannot detect
+        this from inside the encoder worker without parsing the
+        H.264 bitstream and cross-referencing frame counts; we
+        do not.
+
+        Diagnostic counterpart: every packet's libmfx-derived
+        ``pkt.pts`` and ``pkt.dts`` are logged at DEBUG level into
+        the per-session ``session.log`` alongside the synthesized
+        values, so the magnitude and frequency of Intel's
+        ``mfxBitstream.TimeStamp`` defect on the running hardware
+        is forensically observable. Every disagreement between
+        the libmfx-derived ``pkt.pts`` and the synthesized value
+        also emits a WARNING-level line - a future reader scanning
+        ``session.log`` for ``WARNING`` will see exactly how
+        broken Intel's H.264 path is on this driver / hardware /
+        configuration combination, and exactly which packet
+        indices are affected.
         """
-        # Snapshot the libmfx-derived packet metadata BEFORE the
-        # ``pkt.dts := pkt.pts`` override and BEFORE any other
-        # mutation. Logged at DEBUG so the per-session ``session.log``
-        # carries a complete forensic trail of every packet h264_qsv
-        # ever emitted on this session - PTS, the raw libmfx-derived
-        # DTS (before override), size, duration, flags, and the
-        # running input-frame counter. Investigating any future
-        # encoder anomaly starts from this trace.
+        # Snapshot the values the Intel oneVPL runtime / FFmpeg's
+        # ``h264_qsv`` wrapper actually wrote into the packet,
+        # BEFORE we overwrite them, so the forensic log captures
+        # the broken upstream state rather than our synthesized
+        # repair of it.
         libmfx_derived_packet_pts_in_stream_time_base_units = (
             output_packet.pts
         )
-        libmfx_derived_packet_dts_before_override_in_stream_time_base_units = (
+        libmfx_derived_packet_dts_in_stream_time_base_units = (
             output_packet.dts
         )
+        synthesized_pts_and_dts_in_stream_time_base_units = (
+            self._next_synthesized_output_packet_pts_in_stream_time_base_units
+        )
+
         self._logger.debug(
             f"Encoder emitted packet: "
-            f"pts={libmfx_derived_packet_pts_in_stream_time_base_units}, "
-            f"dts_raw_pre_override="
-            f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}, "
+            f"libmfx_pts="
+            f"{libmfx_derived_packet_pts_in_stream_time_base_units}, "
+            f"libmfx_dts="
+            f"{libmfx_derived_packet_dts_in_stream_time_base_units}, "
+            f"synthesized_pts_and_dts="
+            f"{synthesized_pts_and_dts_in_stream_time_base_units}, "
             f"size_bytes={output_packet.size}, "
             f"duration={output_packet.duration}, "
             f"is_keyframe={output_packet.is_keyframe}, "
             f"is_corrupt={output_packet.is_corrupt}, "
             f"is_disposable={output_packet.is_disposable}, "
             f"input_frames_processed_so_far="
-            f"{self.frames_successfully_encoded_so_far}, "
-            f"previously_muxed_pts="
-            f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}"
+            f"{self.frames_successfully_encoded_so_far}"
         )
 
-        if output_packet.pts is None:
-            raise EncoderPipelineError(
-                f"h264_qsv produced an output packet with "
-                f"packet.pts == AV_NOPTS_VALUE (None). The recorder "
-                f"feeds the encoder with strictly increasing integer "
-                f"PTS values via "
-                f"``av.VideoFrame.pts = "
-                f"presentation_timestamp_in_one_frame_units``, so "
-                f"every output packet must carry a real PTS. A None "
-                f"PTS at this point indicates an h264_qsv / libmfx "
-                f"contract violation that this program does not "
-                f"silently paper over.\n"
-                f"  Frames successfully encoded before this packet : "
-                f"{self.frames_successfully_encoded_so_far}\n"
-                f"  Most recently muxed packet PTS                  : "
-                f"{self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units}\n"
-                f"  Raw libmfx-derived packet.dts (pre-override)    : "
-                f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}\n"
-                f"  packet.size_bytes                               : "
-                f"{output_packet.size}\n"
-                f"  packet.is_keyframe                              : "
-                f"{output_packet.is_keyframe}\n"
-                f"  packet.is_corrupt                               : "
-                f"{output_packet.is_corrupt}\n"
-                f"  packet.is_disposable                            : "
-                f"{output_packet.is_disposable}"
-            )
-        previously_muxed_pts = (
-            self
-            ._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units
-        )
+        # Flag every observed disagreement between Intel's
+        # libmfx-derived value and the spec-correct synthesized
+        # value at WARNING level. On a working Intel oneVPL runtime
+        # the two would agree on every packet and these WARNINGs
+        # would never fire; on the reference target hardware they
+        # fire from approximately the 6th output packet onward,
+        # which is the empirical fingerprint of Intel's
+        # ``mfxBitstream.TimeStamp``-not-populated defect.
         if (
-            previously_muxed_pts is not None
-            and output_packet.pts <= previously_muxed_pts
+            libmfx_derived_packet_pts_in_stream_time_base_units
+            != synthesized_pts_and_dts_in_stream_time_base_units
         ):
-            raise EncoderPipelineError(
-                f"h264_qsv produced an output packet whose "
-                f"packet.pts is not strictly greater than the "
-                f"previously muxed packet's PTS. The encoder is "
-                f"configured with GopRefDist=1 (no B-frames), so "
-                f"emitted packets must follow input order with "
-                f"strictly increasing PTS. A violation here means "
-                f"either a libmfx defect this program cannot work "
-                f"around, or an unexpected reordering somewhere in "
-                f"the encode pipeline; either way we refuse to mux "
-                f"a non-monotonic packet because the mp4 muxer "
-                f"would reject it anyway with "
-                f"``AVERROR(EINVAL)``. The most likely upstream "
-                f"defect for a duplicate-PTS observation specifically "
-                f"is the unsanitised ``MFX_TIMESTAMP_UNKNOWN`` ->\n"
-                f"``av_rescale_q(0, ...) = 0`` mapping at "
-                f"``libavcodec/qsvenc.c`` line 2667, exposed under "
-                f"low-AsyncDepth pipeline fill; raise async_depth in "
-                f"the constant ``INTEL_QSV_ASYNC_DEPTH_VALUE`` and "
-                f"retry.\n"
-                f"  Previously muxed packet PTS                     : "
-                f"{previously_muxed_pts}\n"
-                f"  Current packet PTS                              : "
-                f"{output_packet.pts}\n"
-                f"  Raw libmfx-derived packet.dts (pre-override)    : "
-                f"{libmfx_derived_packet_dts_before_override_in_stream_time_base_units}\n"
-                f"  packet.size_bytes                               : "
-                f"{output_packet.size}\n"
-                f"  packet.duration                                 : "
-                f"{output_packet.duration}\n"
-                f"  packet.is_keyframe                              : "
-                f"{output_packet.is_keyframe}\n"
-                f"  packet.is_corrupt                               : "
-                f"{output_packet.is_corrupt}\n"
-                f"  packet.is_disposable                            : "
-                f"{output_packet.is_disposable}\n"
-                f"  Frames encoded before this                      : "
-                f"{self.frames_successfully_encoded_so_far}"
+            self._logger.warning(
+                f"Intel oneVPL runtime emitted an output packet "
+                f"whose libmfx-derived ``pkt.pts`` "
+                f"({libmfx_derived_packet_pts_in_stream_time_base_units}) "
+                f"disagrees with the spec-correct value for a "
+                f"B-frame-free H.264 GOP under this program's "
+                f"configuration "
+                f"({synthesized_pts_and_dts_in_stream_time_base_units}). "
+                f"libmfx's value is being discarded. Most likely "
+                f"cause: ``intel/vpl-gpu-rt`` left "
+                f"``mfxBitstream.TimeStamp`` at the "
+                f"``MFX_TIMESTAMP_UNKNOWN`` sentinel or its "
+                f"``av_mallocz``-zeroed initial value, and "
+                f"``libavcodec/qsvenc.c`` line 2667 mapped that to "
+                f"``av_rescale_q(...)`` = 0 without the "
+                f"``MFX_TIMESTAMP_UNKNOWN`` sanitisation present in "
+                f"the sister file ``qsvdec.c`` lines 64-70. Output "
+                f"packet index : "
+                f"{synthesized_pts_and_dts_in_stream_time_base_units}, "
+                f"input frames processed so far : "
+                f"{self.frames_successfully_encoded_so_far}, "
+                f"size_bytes : {output_packet.size}, "
+                f"is_keyframe : {output_packet.is_keyframe}."
             )
-        output_packet.dts = output_packet.pts
-        self._strictly_increasing_pts_watchdog_last_muxed_packet_pts_in_stream_time_base_units = (
-            output_packet.pts
+
+        # Overwrite both PTS and DTS with the spec-correct
+        # synthesized value. PTS == DTS for a B-frame-free GOP per
+        # the H.264 specification; ``INTEL_QSV_MAX_B_FRAMES_VALUE``
+        # is what guarantees B-frame-free.
+        output_packet.pts = (
+            synthesized_pts_and_dts_in_stream_time_base_units
         )
+        output_packet.dts = (
+            synthesized_pts_and_dts_in_stream_time_base_units
+        )
+
+        # Advance the counter exactly once per muxed packet, so
+        # that the next packet's synthesized value is strictly
+        # one greater.
+        self._next_synthesized_output_packet_pts_in_stream_time_base_units += 1
+
         output_container.mux(output_packet)
 
     def _verify_encoder_codec_context_post_open_state_matches_explicit_configuration(
@@ -3045,19 +3111,21 @@ class _IntelQuickSyncVideoFragmentedMp4EncoderWorker(threading.Thread):
         # declaration in Section 2: without this, FFmpeg's
         # ``h264_qsv`` defaults ``avctx->max_b_frames`` to -1 (the
         # "Intel oneVPL runtime picks" sentinel), the runtime picks
-        # ``GopRefDist=3`` on Intel UHD Graphics 770, and the encoder
-        # emits packets in H.264-decode order (which differs from
-        # display order in a B-frame GOP) - which directly violates
-        # both the ``pkt.dts := pkt.pts`` override and the strict-
-        # monotonic-PTS watchdog in
-        # ``_mux_one_encoded_packet_with_dts_forced_to_pts``.
+        # ``GopRefDist=3`` on the integrated Intel UHD Graphics 770
+        # GPU, and the encoder emits packets in H.264 decode order
+        # (which differs from display order in a B-frame GOP) -
+        # invalidating the foundational invariant that makes
+        # the PTS/DTS synthesis in
+        # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+        # spec-correct (encode order == display order == input order).
         observed_max_b_frames_value = codec_context.max_b_frames
         if observed_max_b_frames_value != INTEL_QSV_MAX_B_FRAMES_VALUE:
             raise EncoderPipelineError(
                 f"FFmpeg's libavcodec ``AVCodecContext.max_b_frames`` "
                 f"does not match the value this program requires for "
-                f"the ``pkt.dts := pkt.pts`` override and the strict-"
-                f"monotonic-PTS watchdog to be H.264-spec-correct. "
+                f"the synthesized-PTS/DTS pipeline in "
+                f"``_mux_one_encoded_packet_with_synthesized_pts_and_dts`` "
+                f"to be H.264-spec-correct. "
                 f"This program is hard-wired to ``max_b_frames = 0`` "
                 f"(B-frames disabled); see the long-form rationale at "
                 f"the ``INTEL_QSV_MAX_B_FRAMES_VALUE`` constant in "
