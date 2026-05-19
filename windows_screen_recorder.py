@@ -28,7 +28,14 @@ It is intentionally opinionated:
     new frames into the encoder queue. The video's presentation-timestamp
     counter is *not* advanced during pause, so the final video plays back as
     a seamless cut across each pause boundary - no padded duplicate frames
-    and no gap in playback time.
+    and no gap in playback time. Cumulative paused wall-clock duration -
+    including any pause segment still open at this instant - is owned by a
+    single ``_PauseDurationBookkeeper`` instance on the capture worker; the
+    operator-facing "Recorded so far" counter, the session.json metadata
+    writer, the capture worker's own PTS calculation, the per-frame CSV
+    writer, and the worker's exit log all read it via a time-parameterised
+    query, so the displayed recorded duration freezes while paused and the
+    session-metadata total is accurate even when Stop is pressed mid-pause.
 
 Operator-facing behavior
 ------------------------
@@ -1876,6 +1883,185 @@ _ENCODER_SHUTDOWN_SENTINEL: Final[_EncoderShutdownSentinelType] = (
 # Section 13 - Capture thread: python-mss BGRA frame producer
 # ============================================================================
 
+
+class _MonotonicClockWentBackwardError(ScreenRecorderError):
+    """``time.monotonic()`` returned a value earlier than a previously sampled value.
+
+    Microsoft Windows' ``QueryPerformanceCounter`` (which CPython 3.11's
+    ``time.monotonic()`` is layered on) is contractually non-decreasing.
+    Observing a backward step indicates a driver-class regression we
+    refuse to silently paper over: it would corrupt the pause-duration
+    bookkeeping and every PTS derived from it. Raising here points the
+    operator at the root cause instead.
+    """
+
+
+class _PauseDurationBookkeeper:
+    """Single source of truth for cumulative operator-pause wall-clock time.
+
+    Owned by the capture worker (it is the sole writer); read by the
+    capture worker's own PTS calculation, by the controller's live
+    statistics snapshot, by the lifecycle thread's session-metadata
+    writer, and by the worker's exit log. Every reader goes through the
+    same time-parameterised query method, so all of them see a
+    consistent answer at every instant - including instants that fall
+    inside a still-open pause segment.
+
+    Threading
+    ---------
+    All writes happen on the capture worker thread. Reads come from any
+    thread. Internal mutual exclusion is provided by a private
+    ``threading.Lock`` that is never held while calling out to any
+    other code; the bookkeeper never acquires anyone else's lock, so it
+    is impossible to involve this object in a lock-ordering cycle with
+    the controller's state lock.
+
+    Time discipline
+    ---------------
+    Methods take a caller-supplied ``now_monotonic`` argument rather
+    than sampling ``time.monotonic()`` internally. That choice has two
+    consequences worth being explicit about:
+
+      1. The capture worker's PTS calculation and per-frame CSV write
+         pass the *capture-instant* ``time.monotonic()`` value the
+         worker had already sampled, so the per-frame log row and the
+         frame's PTS reflect exactly the same instant.
+
+      2. The bookkeeper is deterministic in tests: a fake clock can be
+         driven without monkey-patching the ``time`` module.
+
+    Invariants enforced internally
+    ------------------------------
+      * ``_completed_pause_total_seconds`` is non-negative and
+        non-decreasing across every public mutation.
+      * Inside a pause segment, ``_open_segment_started_monotonic`` is
+        not ``None``; outside one it is ``None``. ``begin_pause_segment``
+        and ``end_pause_segment`` cross-check this invariant and raise
+        ``InconsistentControllerStateAssertionError`` on violation,
+        because every reachable caller is the capture worker loop.
+      * Every method that derives a duration from a stored monotonic
+        instant verifies that ``now_monotonic`` is not less than that
+        stored instant, and raises ``_MonotonicClockWentBackwardError``
+        if it is.
+    """
+
+    def __init__(self) -> None:
+        self._internal_lock: threading.Lock = threading.Lock()
+        self._completed_pause_total_seconds: float = 0.0
+        self._open_segment_started_monotonic: Optional[float] = None
+
+    def begin_pause_segment(self, now_monotonic: float) -> None:
+        """Open a new pause segment. Raises if one is already open."""
+        with self._internal_lock:
+            if self._open_segment_started_monotonic is not None:
+                raise InconsistentControllerStateAssertionError(
+                    f"_PauseDurationBookkeeper.begin_pause_segment() "
+                    f"called while a pause segment was already open. "
+                    f"Open since (monotonic): "
+                    f"{self._open_segment_started_monotonic}; "
+                    f"new request at (monotonic): {now_monotonic}. "
+                    f"This is a defect in the capture worker loop - "
+                    f"only the worker should call this method, and "
+                    f"only when it has just transitioned from not-"
+                    f"paused to paused."
+                )
+            self._open_segment_started_monotonic = now_monotonic
+
+    def end_pause_segment(self, now_monotonic: float) -> float:
+        """Close the open pause segment, fold its duration into the total.
+
+        Returns the just-closed segment's duration in seconds. Raises if
+        no segment is open, or if ``now_monotonic`` is earlier than the
+        segment's start instant.
+        """
+        with self._internal_lock:
+            return self._end_open_segment_under_lock(
+                now_monotonic=now_monotonic,
+                require_open_segment=True,
+            )
+
+    def finalize_any_open_segment(self, now_monotonic: float) -> float:
+        """Idempotent: close any open segment, or no-op if none is open.
+
+        The capture worker calls this in its loop's ``finally`` so that
+        every exit path (graceful Stop during pause, Force-Cancel during
+        pause, worker self-failure, worker exception, normal end-of-
+        recording) leaves the bookkeeper in a consistent terminal state.
+        Returns the closed segment's duration, or 0.0 if there was
+        nothing to close.
+        """
+        with self._internal_lock:
+            if self._open_segment_started_monotonic is None:
+                return 0.0
+            return self._end_open_segment_under_lock(
+                now_monotonic=now_monotonic,
+                require_open_segment=False,
+            )
+
+    def _end_open_segment_under_lock(
+        self,
+        *,
+        now_monotonic: float,
+        require_open_segment: bool,
+    ) -> float:
+        if self._open_segment_started_monotonic is None:
+            if require_open_segment:
+                raise InconsistentControllerStateAssertionError(
+                    f"_PauseDurationBookkeeper.end_pause_segment() "
+                    f"called with no pause segment open. Caller "
+                    f"requested at (monotonic): {now_monotonic}. This "
+                    f"is a defect in the capture worker loop."
+                )
+            return 0.0
+        opened_at = self._open_segment_started_monotonic
+        if now_monotonic < opened_at:
+            raise _MonotonicClockWentBackwardError(
+                f"_PauseDurationBookkeeper observed time.monotonic() "
+                f"running backwards while closing a pause segment.\n"
+                f"  Segment opened at (monotonic) : {opened_at}\n"
+                f"  Close requested at (monotonic): {now_monotonic}\n"
+                f"  Backward delta (seconds)      : "
+                f"{opened_at - now_monotonic}\n"
+                f"On Microsoft Windows ``time.monotonic()`` is layered "
+                f"on ``QueryPerformanceCounter`` and is contractually "
+                f"non-decreasing; observing this here indicates a "
+                f"driver-class regression rather than a defect in this "
+                f"program."
+            )
+        duration = now_monotonic - opened_at
+        self._completed_pause_total_seconds += duration
+        self._open_segment_started_monotonic = None
+        return duration
+
+    def is_currently_inside_pause_segment(self) -> bool:
+        with self._internal_lock:
+            return self._open_segment_started_monotonic is not None
+
+    def total_paused_wall_clock_seconds(
+        self, now_monotonic: float
+    ) -> float:
+        """Total paused wall-clock seconds as of ``now_monotonic``.
+
+        Includes any pause segment still open at this instant. This is
+        the SINGLE method every reader (worker PTS calculation, GUI
+        snapshot, session-metadata writer, exit log) calls. Two
+        successive reads with non-decreasing ``now_monotonic`` arguments
+        always return non-decreasing values.
+        """
+        with self._internal_lock:
+            completed = self._completed_pause_total_seconds
+            opened_at = self._open_segment_started_monotonic
+            if opened_at is None:
+                return completed
+            # Belt to the braces on the monotonic-clock-backwards
+            # assertion: writers (the worker) raise loudly; readers
+            # clamp at zero so a transient clock glitch from a
+            # background thread reader does not surface as a negative
+            # duration in the GUI status line.
+            in_flight = max(0.0, now_monotonic - opened_at)
+            return completed + in_flight
+
+
 class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
     """Worker thread that captures Display 1 BGRA frames at the target FPS.
 
@@ -1891,6 +2077,16 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
     Frame indices (used as H.264 presentation timestamps) are NOT advanced
     during pause, so the final video plays back as a seamless cut across
     every pause boundary.
+
+    Cumulative paused wall-clock duration - including any pause segment
+    still open at this instant - is exposed via
+    ``self.pause_duration_bookkeeper.total_paused_wall_clock_seconds(
+    now_monotonic)``. That bookkeeper is the single source of truth that
+    the operator-facing 'Recorded so far' counter, the session.json
+    metadata writer, this worker's own PTS calculation, the per-frame
+    CSV writer, and this worker's exit log all read; they all see a
+    consistent value at any instant, even one that falls inside an
+    in-progress pause.
     """
 
     def __init__(
@@ -1922,8 +2118,24 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
 
         # Live statistics for GUI display.
         self.frames_successfully_captured_so_far: int = 0
+        # CFR-pacing drift drop: the host fell so far behind the
+        # 1/TARGET_OUTPUT_FRAMES_PER_SECOND schedule grid that emitting
+        # the next captured frame would land in a PTS slot the previous
+        # frame already occupies, and the cause is host capture lag
+        # (no pause boundary involved). Distinguished from the
+        # pause-boundary slot-collision counter below so the operator
+        # forensics can tell host-overload from pause-discontinuity at
+        # a glance.
         self.frames_dropped_due_to_capture_lag_so_far: int = 0
-        self.total_paused_wall_clock_seconds: float = 0.0
+        # Pause-boundary slot-collision drop: the operator paused for
+        # less than one full 1/TARGET_OUTPUT_FRAMES_PER_SECOND slot, so
+        # the first post-resume PTS lands in the same slot the last
+        # pre-pause PTS occupies. Not host lag; this is structural to
+        # the seamless-cut pause discipline.
+        self.frames_dropped_due_to_pause_boundary_slot_collision_so_far: int = 0
+        self.pause_duration_bookkeeper: _PauseDurationBookkeeper = (
+            _PauseDurationBookkeeper()
+        )
         self.recording_start_monotonic_seconds: Optional[float] = None
         self.last_captured_frame_monotonic_seconds: Optional[float] = None
 
@@ -1974,7 +2186,6 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
             scheduled_next_capture_monotonic = (
                 self.recording_start_monotonic_seconds
             )
-            pause_started_monotonic: Optional[float] = None
             # Variable-frame-rate (VFR) capture timestamping. Every
             # captured BGRA frame's PTS is anchored to the real
             # wall-clock instant of its python-mss BitBlt, expressed
@@ -2017,251 +2228,334 @@ class _SingleDisplayPrimaryMonitorCaptureWorker(threading.Thread):
             last_emitted_presentation_timestamp_in_stream_time_base_units: Optional[
                 int
             ] = None
+            # True iff the previous loop iteration finalized a pause
+            # segment (the worker observed resume on this iteration).
+            # Used by the strict-monotonic-PTS guard to attribute the
+            # next drop, if any, to the pause boundary rather than to
+            # host capture lag. Cleared the moment we successfully
+            # emit a frame.
+            just_resumed_from_pause_segment: bool = False
 
-            while not self._stop_event.is_set():
-                # ----- Pause/resume bookkeeping -----
-                if self._pause_event.is_set():
-                    if pause_started_monotonic is None:
-                        pause_started_monotonic = time.monotonic()
-                        self._logger.info(
-                            "Capture worker observed pause request at "
-                            "most-recent-emitted PTS "
-                            f"{last_emitted_presentation_timestamp_in_stream_time_base_units}."
-                        )
-                    # Use Event.wait, not time.sleep, so the worker wakes
-                    # up the instant the operator presses Stop. The wait
-                    # returns True if stop_event is set during the wait.
-                    if self._stop_event.wait(timeout=0.020):
-                        break
-                    continue
-                if pause_started_monotonic is not None:
-                    pause_duration_seconds = (
-                        time.monotonic() - pause_started_monotonic
-                    )
-                    self.total_paused_wall_clock_seconds += pause_duration_seconds
-                    self._logger.info(
-                        f"Capture worker observed resume after a pause of "
-                        f"{pause_duration_seconds * 1000.0:.1f} milliseconds."
-                    )
-                    pause_started_monotonic = None
-                    scheduled_next_capture_monotonic = time.monotonic()
-
-                # ----- CFR pacing -----
-                now_monotonic = time.monotonic()
-                if now_monotonic < scheduled_next_capture_monotonic:
-                    # Wait via Event so the operator's Stop request
-                    # interrupts the pacing sleep immediately.
-                    if self._stop_event.wait(
-                        timeout=scheduled_next_capture_monotonic
-                        - now_monotonic
+            # try/finally around the loop body so that *every* exit
+            # path (graceful stop, stop-during-pause, force-cancel,
+            # worker self-failure, propagating exception) ends any
+            # pause segment that is still open. The bookkeeper's
+            # ``finalize_any_open_segment`` is idempotent, so this is
+            # safe to run unconditionally.
+            try:
+                while not self._stop_event.is_set():
+                    # ----- Pause/resume bookkeeping -----
+                    if self._pause_event.is_set():
+                        if not (
+                            self
+                            .pause_duration_bookkeeper
+                            .is_currently_inside_pause_segment()
+                        ):
+                            self.pause_duration_bookkeeper.begin_pause_segment(
+                                time.monotonic()
+                            )
+                            self._logger.info(
+                                "Capture worker observed pause request at "
+                                "most-recent-emitted PTS "
+                                f"{last_emitted_presentation_timestamp_in_stream_time_base_units}."
+                            )
+                        # Use Event.wait, not time.sleep, so the worker
+                        # wakes up the instant the operator presses
+                        # Stop. The wait returns True if stop_event is
+                        # set during the wait.
+                        if self._stop_event.wait(timeout=0.020):
+                            break
+                        continue
+                    if (
+                        self
+                        .pause_duration_bookkeeper
+                        .is_currently_inside_pause_segment()
                     ):
-                        break
-                    continue
-                # If we have drifted more than one full second behind
-                # schedule, the host is too loaded for CFR pacing; we reset
-                # the schedule baseline rather than capture in a tight loop.
-                if (
-                    now_monotonic
-                    > scheduled_next_capture_monotonic
-                    + max(1.0, 30.0 * target_capture_interval_seconds)
-                ):
-                    drift_seconds = (
-                        now_monotonic - scheduled_next_capture_monotonic
-                    )
-                    self._logger.warning(
-                        f"Capture loop fell {drift_seconds:.3f} seconds "
-                        f"behind schedule; resetting CFR baseline to "
-                        f"the current monotonic instant."
-                    )
-                    scheduled_next_capture_monotonic = now_monotonic
+                        pause_duration_seconds = (
+                            self
+                            .pause_duration_bookkeeper
+                            .end_pause_segment(time.monotonic())
+                        )
+                        self._logger.info(
+                            f"Capture worker observed resume after a pause of "
+                            f"{pause_duration_seconds * 1000.0:.1f} milliseconds."
+                        )
+                        just_resumed_from_pause_segment = True
+                        scheduled_next_capture_monotonic = time.monotonic()
 
-                # ----- Capture one BGRA frame -----
-                capture_start_monotonic = time.monotonic()
-                # Compute the spec-correct VFR PTS for this capture
-                # instant. ``elapsed_recording_seconds_since_session_start``
-                # is real wall-clock time since the capture loop began,
-                # minus accumulated pause durations; the recorder
-                # docstring at the top of the file declares that
-                # pauses are NOT advanced over in the encoded output,
-                # so a 5-second pause produces a seamless cut rather
-                # than 5 seconds of frozen content. Multiplying by
-                # ``TARGET_OUTPUT_FRAMES_PER_SECOND`` converts wall-
-                # clock seconds to stream time-base units (where the
-                # stream's ``time_base`` is
-                # ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``),
-                # and ``round`` snaps to the nearest 1/30-second
-                # output frame slot.
-                elapsed_recording_seconds_since_session_start = (
-                    capture_start_monotonic
-                    - self.recording_start_monotonic_seconds
-                    - self.total_paused_wall_clock_seconds
-                )
-                candidate_presentation_timestamp_in_stream_time_base_units = (
-                    round(
-                        elapsed_recording_seconds_since_session_start
-                        * TARGET_OUTPUT_FRAMES_PER_SECOND
+                    # ----- CFR pacing -----
+                    now_monotonic = time.monotonic()
+                    if now_monotonic < scheduled_next_capture_monotonic:
+                        # Wait via Event so the operator's Stop request
+                        # interrupts the pacing sleep immediately.
+                        if self._stop_event.wait(
+                            timeout=scheduled_next_capture_monotonic
+                            - now_monotonic
+                        ):
+                            break
+                        continue
+                    # If we have drifted more than one full second behind
+                    # schedule, the host is too loaded for CFR pacing; we reset
+                    # the schedule baseline rather than capture in a tight loop.
+                    if (
+                        now_monotonic
+                        > scheduled_next_capture_monotonic
+                        + max(1.0, 30.0 * target_capture_interval_seconds)
+                    ):
+                        drift_seconds = (
+                            now_monotonic - scheduled_next_capture_monotonic
+                        )
+                        self._logger.warning(
+                            f"Capture loop fell {drift_seconds:.3f} seconds "
+                            f"behind schedule; resetting CFR baseline to "
+                            f"the current monotonic instant."
+                        )
+                        scheduled_next_capture_monotonic = now_monotonic
+
+                    # ----- Capture one BGRA frame -----
+                    capture_start_monotonic = time.monotonic()
+                    # Compute the spec-correct VFR PTS for this capture
+                    # instant. ``elapsed_recording_seconds_since_session_start``
+                    # is real wall-clock time since the capture loop began,
+                    # minus accumulated pause durations; the recorder
+                    # docstring at the top of the file declares that
+                    # pauses are NOT advanced over in the encoded output,
+                    # so a 5-second pause produces a seamless cut rather
+                    # than 5 seconds of frozen content. Multiplying by
+                    # ``TARGET_OUTPUT_FRAMES_PER_SECOND`` converts wall-
+                    # clock seconds to stream time-base units (where the
+                    # stream's ``time_base`` is
+                    # ``Fraction(1, TARGET_OUTPUT_FRAMES_PER_SECOND)``),
+                    # and ``round`` snaps to the nearest 1/30-second
+                    # output frame slot. The paused-seconds value is
+                    # sourced from ``pause_duration_bookkeeper`` and
+                    # evaluated *at the capture instant*, so this PTS
+                    # and the per-frame CSV row written further down
+                    # reflect exactly the same as-of moment.
+                    elapsed_recording_seconds_since_session_start = (
+                        capture_start_monotonic
+                        - self.recording_start_monotonic_seconds
+                        - self.pause_duration_bookkeeper
+                        .total_paused_wall_clock_seconds(
+                            capture_start_monotonic
+                        )
                     )
-                )
-                # Strict-monotonic guard: the encoder-side synthesis
-                # in
-                # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
-                # requires every input frame's PTS to be strictly
-                # greater than the previously enqueued frame's PTS.
-                # If the candidate PTS would land in the same (or an
-                # earlier) 1/TARGET_OUTPUT_FRAMES_PER_SECOND wall-
-                # clock slot the previously emitted frame already
-                # occupies, this capture is silently dropped: the
-                # output already represents this slot, so emitting
-                # another frame for it would either duplicate content
-                # the player will not display (the player only shows
-                # one frame per PTS slot) or violate the encoder's
-                # strict-monotonic-PTS invariant. The CFR pacing
-                # logic above is the primary line of defence against
-                # this; the guard here is the secondary line that
-                # holds across clock anomalies (a monotonic-clock
-                # backward jump, a host wake-from-sleep, a Microsoft
-                # Windows kernel scheduler quantum that runs us twice
-                # in one slot).
-                if (
-                    last_emitted_presentation_timestamp_in_stream_time_base_units
-                    is not None
-                    and candidate_presentation_timestamp_in_stream_time_base_units
-                    <= last_emitted_presentation_timestamp_in_stream_time_base_units
-                ):
-                    self.frames_dropped_due_to_capture_lag_so_far += 1
+                    candidate_presentation_timestamp_in_stream_time_base_units = (
+                        round(
+                            elapsed_recording_seconds_since_session_start
+                            * TARGET_OUTPUT_FRAMES_PER_SECOND
+                        )
+                    )
+                    # Strict-monotonic guard: the encoder-side synthesis
+                    # in
+                    # ``_mux_one_encoded_packet_with_synthesized_pts_and_dts``
+                    # requires every input frame's PTS to be strictly
+                    # greater than the previously enqueued frame's PTS.
+                    # If the candidate PTS would land in the same (or an
+                    # earlier) 1/TARGET_OUTPUT_FRAMES_PER_SECOND wall-
+                    # clock slot the previously emitted frame already
+                    # occupies, this capture is silently dropped: the
+                    # output already represents this slot, so emitting
+                    # another frame for it would either duplicate content
+                    # the player will not display (the player only shows
+                    # one frame per PTS slot) or violate the encoder's
+                    # strict-monotonic-PTS invariant. The CFR pacing
+                    # logic above is the primary line of defence against
+                    # this; the guard here is the secondary line that
+                    # holds across clock anomalies (a monotonic-clock
+                    # backward jump, a host wake-from-sleep, a Microsoft
+                    # Windows kernel scheduler quantum that runs us twice
+                    # in one slot) AND across pause-resume boundaries
+                    # where the operator paused for less than one full
+                    # 1/TARGET_OUTPUT_FRAMES_PER_SECOND slot. The drop
+                    # counter is split so the operator forensics can
+                    # tell the two causes apart at a glance:
+                    # ``frames_dropped_due_to_capture_lag_so_far`` is
+                    # incremented when the drop happens during steady-
+                    # state capture; ``frames_dropped_due_to_pause_
+                    # boundary_slot_collision_so_far`` is incremented
+                    # when the drop happens on the first iteration
+                    # after a resume.
+                    if (
+                        last_emitted_presentation_timestamp_in_stream_time_base_units
+                        is not None
+                        and candidate_presentation_timestamp_in_stream_time_base_units
+                        <= last_emitted_presentation_timestamp_in_stream_time_base_units
+                    ):
+                        if just_resumed_from_pause_segment:
+                            self.frames_dropped_due_to_pause_boundary_slot_collision_so_far += 1
+                        else:
+                            self.frames_dropped_due_to_capture_lag_so_far += 1
+                        scheduled_next_capture_monotonic += (
+                            target_capture_interval_seconds
+                        )
+                        continue
+                    current_capture_presentation_timestamp_in_stream_time_base_units = (
+                        candidate_presentation_timestamp_in_stream_time_base_units
+                    )
+
+                    try:
+                        raw_screenshot = sct.grab(mss_monitor_capture_region)
+                    except Exception as mss_grab_exc:
+                        raise ScreenFrameCaptureFailureError(
+                            f"python-mss .grab() raised "
+                            f"{type(mss_grab_exc).__name__}: {mss_grab_exc}\n"
+                            f"  PTS attempted (stream time-base units) : "
+                            f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
+                            f"  Capture region                          : "
+                            f"{mss_monitor_capture_region}\n"
+                            f"  Wall-clock monotonic                    : "
+                            f"{capture_start_monotonic}\n"
+                            f"This typically indicates the operator's "
+                            f"Microsoft Windows session has lost its desktop "
+                            f"(eg the workstation was locked or the user "
+                            f"switched). This program does not capture across "
+                            f"such session transitions."
+                        ) from mss_grab_exc
+
+                    # Validate frame shape. mss returns shape (H, W, 4) BGRA.
+                    if (
+                        raw_screenshot.height != expected_frame_height_pixels
+                        or raw_screenshot.width != expected_frame_width_pixels
+                    ):
+                        raise ScreenFrameCaptureFailureError(
+                            f"python-mss returned a frame whose pixel "
+                            f"dimensions disagree with the validated display "
+                            f"configuration. The display configuration was "
+                            f"presumably changed mid-recording, which this "
+                            f"program does not support.\n"
+                            f"  Expected   : "
+                            f"{expected_frame_width_pixels}x"
+                            f"{expected_frame_height_pixels}\n"
+                            f"  Got        : "
+                            f"{raw_screenshot.width}x{raw_screenshot.height}\n"
+                            f"  PTS        : "
+                            f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
+                            f"Resolution: stop the recording, restore the "
+                            f"original Microsoft Windows display configuration, "
+                            f"and start a fresh recording."
+                        )
+
+                    # Detach the BGRA pixel buffer from the python-mss
+                    # ScreenShot object via np.frombuffer + .copy(). The
+                    # python-mss ScreenShot constructor at v6.1.0 already
+                    # copies the underlying GDI bytearray once, but we copy
+                    # again to fully detach from any python-mss-internal
+                    # lifetime so passing across the thread boundary is safe.
+                    bgra_pixel_buffer = np.frombuffer(
+                        raw_screenshot.raw, dtype=np.uint8
+                    ).reshape(
+                        expected_frame_height_pixels,
+                        expected_frame_width_pixels,
+                        4,
+                    ).copy()
+
+                    # ----- Enqueue for encoder -----
+                    try:
+                        self._queue.put(
+                            _CapturedFrameForEncoder(
+                                presentation_timestamp_in_one_frame_units=(
+                                    current_capture_presentation_timestamp_in_stream_time_base_units
+                                ),
+                                bgra_frame_pixel_buffer=bgra_pixel_buffer,
+                                monotonic_capture_instant_seconds=(
+                                    capture_start_monotonic
+                                ),
+                            ),
+                            timeout=5.0,
+                        )
+                    except queue.Full as queue_full_exc:
+                        raise EncoderBackPressureError(
+                            f"The capture-to-encoder queue has been at its "
+                            f"capacity of {CAPTURE_TO_ENCODER_QUEUE_MAXIMUM_DEPTH_FRAMES} "
+                            f"frames for more than 5 seconds. The Intel Quick "
+                            f"Sync Video H.264 encoder cannot consume frames as "
+                            f"fast as Display 1 is producing them.\n"
+                            f"  PTS that failed to enqueue : "
+                            f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
+                            f"  Target capture rate         : "
+                            f"{TARGET_OUTPUT_FRAMES_PER_SECOND} fps\n"
+                            f"This program does not silently drop frames in "
+                            f"that condition. Resolution: reduce the captured "
+                            f"display's resolution, or shut down the offending "
+                            f"background workload."
+                        ) from queue_full_exc
+
+                    # ----- Per-frame CSV log + sync -----
+                    # Query the pause bookkeeper with the same capture
+                    # instant the PTS calculation used, so the CSV row
+                    # records the cumulative paused total as of exactly
+                    # that instant. When we reach this point the
+                    # bookkeeper has no open segment (a resume was
+                    # finalized on entry to this loop iteration if one
+                    # was pending), so the returned value equals the
+                    # bookkeeper's ``_completed_pause_total_seconds``;
+                    # funnelling the read through the single API is
+                    # nonetheless the point - every reader takes the
+                    # same path.
+                    with self._csv_lock:
+                        self._csv_writer.writerow(
+                            [
+                                current_capture_presentation_timestamp_in_stream_time_base_units,
+                                f"{capture_start_monotonic:.6f}",
+                                f"{self.pause_duration_bookkeeper.total_paused_wall_clock_seconds(capture_start_monotonic):.6f}",
+                            ]
+                        )
+                        self._csv_file_handle.flush()
+                        try:
+                            os.fsync(self._csv_file_handle.fileno())
+                        except OSError:
+                            # Best-effort fsync; some Microsoft Windows
+                            # filesystem drivers do not support fsync on
+                            # text-mode handles. Not fatal.
+                            pass
+
+                    self.frames_successfully_captured_so_far += 1
+                    self.last_captured_frame_monotonic_seconds = capture_start_monotonic
+                    last_emitted_presentation_timestamp_in_stream_time_base_units = (
+                        current_capture_presentation_timestamp_in_stream_time_base_units
+                    )
+                    # A frame was successfully emitted, so any
+                    # pause-boundary slot collision blamed on this
+                    # particular resume is now in the past; clear the
+                    # flag so any subsequent drop attributes to capture
+                    # lag (the default) rather than to the same pause
+                    # boundary.
+                    just_resumed_from_pause_segment = False
+                    # Advance the schedule baseline strictly by the target
+                    # interval (not by the actual elapsed time): this is
+                    # what holds the schedule's "next slot" line on the
+                    # original 1/TARGET_OUTPUT_FRAMES_PER_SECOND grid
+                    # rather than drifting on cumulative jitter.
                     scheduled_next_capture_monotonic += (
                         target_capture_interval_seconds
                     )
-                    continue
-                current_capture_presentation_timestamp_in_stream_time_base_units = (
-                    candidate_presentation_timestamp_in_stream_time_base_units
+            finally:
+                # Single-point finalization for every exit path
+                # (graceful Stop, Stop-during-pause, Force-Cancel,
+                # worker self-failure, propagating exception). The
+                # bookkeeper's ``finalize_any_open_segment`` is
+                # idempotent, so it is safe to call regardless of
+                # whether the loop broke out of the pause branch with
+                # a segment still open or finished normally with no
+                # segment open.
+                self.pause_duration_bookkeeper.finalize_any_open_segment(
+                    time.monotonic()
                 )
 
-                try:
-                    raw_screenshot = sct.grab(mss_monitor_capture_region)
-                except Exception as mss_grab_exc:
-                    raise ScreenFrameCaptureFailureError(
-                        f"python-mss .grab() raised "
-                        f"{type(mss_grab_exc).__name__}: {mss_grab_exc}\n"
-                        f"  PTS attempted (stream time-base units) : "
-                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
-                        f"  Capture region                          : "
-                        f"{mss_monitor_capture_region}\n"
-                        f"  Wall-clock monotonic                    : "
-                        f"{capture_start_monotonic}\n"
-                        f"This typically indicates the operator's "
-                        f"Microsoft Windows session has lost its desktop "
-                        f"(eg the workstation was locked or the user "
-                        f"switched). This program does not capture across "
-                        f"such session transitions."
-                    ) from mss_grab_exc
-
-                # Validate frame shape. mss returns shape (H, W, 4) BGRA.
-                if (
-                    raw_screenshot.height != expected_frame_height_pixels
-                    or raw_screenshot.width != expected_frame_width_pixels
-                ):
-                    raise ScreenFrameCaptureFailureError(
-                        f"python-mss returned a frame whose pixel "
-                        f"dimensions disagree with the validated display "
-                        f"configuration. The display configuration was "
-                        f"presumably changed mid-recording, which this "
-                        f"program does not support.\n"
-                        f"  Expected   : "
-                        f"{expected_frame_width_pixels}x"
-                        f"{expected_frame_height_pixels}\n"
-                        f"  Got        : "
-                        f"{raw_screenshot.width}x{raw_screenshot.height}\n"
-                        f"  PTS        : "
-                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
-                        f"Resolution: stop the recording, restore the "
-                        f"original Microsoft Windows display configuration, "
-                        f"and start a fresh recording."
-                    )
-
-                # Detach the BGRA pixel buffer from the python-mss
-                # ScreenShot object via np.frombuffer + .copy(). The
-                # python-mss ScreenShot constructor at v6.1.0 already
-                # copies the underlying GDI bytearray once, but we copy
-                # again to fully detach from any python-mss-internal
-                # lifetime so passing across the thread boundary is safe.
-                bgra_pixel_buffer = np.frombuffer(
-                    raw_screenshot.raw, dtype=np.uint8
-                ).reshape(
-                    expected_frame_height_pixels,
-                    expected_frame_width_pixels,
-                    4,
-                ).copy()
-
-                # ----- Enqueue for encoder -----
-                try:
-                    self._queue.put(
-                        _CapturedFrameForEncoder(
-                            presentation_timestamp_in_one_frame_units=(
-                                current_capture_presentation_timestamp_in_stream_time_base_units
-                            ),
-                            bgra_frame_pixel_buffer=bgra_pixel_buffer,
-                            monotonic_capture_instant_seconds=(
-                                capture_start_monotonic
-                            ),
-                        ),
-                        timeout=5.0,
-                    )
-                except queue.Full as queue_full_exc:
-                    raise EncoderBackPressureError(
-                        f"The capture-to-encoder queue has been at its "
-                        f"capacity of {CAPTURE_TO_ENCODER_QUEUE_MAXIMUM_DEPTH_FRAMES} "
-                        f"frames for more than 5 seconds. The Intel Quick "
-                        f"Sync Video H.264 encoder cannot consume frames as "
-                        f"fast as Display 1 is producing them.\n"
-                        f"  PTS that failed to enqueue : "
-                        f"{current_capture_presentation_timestamp_in_stream_time_base_units}\n"
-                        f"  Target capture rate         : "
-                        f"{TARGET_OUTPUT_FRAMES_PER_SECOND} fps\n"
-                        f"This program does not silently drop frames in "
-                        f"that condition. Resolution: reduce the captured "
-                        f"display's resolution, or shut down the offending "
-                        f"background workload."
-                    ) from queue_full_exc
-
-                # ----- Per-frame CSV log + sync -----
-                with self._csv_lock:
-                    self._csv_writer.writerow(
-                        [
-                            current_capture_presentation_timestamp_in_stream_time_base_units,
-                            f"{capture_start_monotonic:.6f}",
-                            f"{self.total_paused_wall_clock_seconds:.6f}",
-                        ]
-                    )
-                    self._csv_file_handle.flush()
-                    try:
-                        os.fsync(self._csv_file_handle.fileno())
-                    except OSError:
-                        # Best-effort fsync; some Microsoft Windows
-                        # filesystem drivers do not support fsync on
-                        # text-mode handles. Not fatal.
-                        pass
-
-                self.frames_successfully_captured_so_far += 1
-                self.last_captured_frame_monotonic_seconds = capture_start_monotonic
-                last_emitted_presentation_timestamp_in_stream_time_base_units = (
-                    current_capture_presentation_timestamp_in_stream_time_base_units
-                )
-                # Advance the schedule baseline strictly by the target
-                # interval (not by the actual elapsed time): this is
-                # what holds the schedule's "next slot" line on the
-                # original 1/TARGET_OUTPUT_FRAMES_PER_SECOND grid
-                # rather than drifting on cumulative jitter.
-                scheduled_next_capture_monotonic += (
-                    target_capture_interval_seconds
-                )
-
+        # Sample ``time.monotonic()`` exactly once for the exit log so
+        # the "total paused" and the implied "wall clock at exit"
+        # numbers are coherent.
+        exit_log_now_monotonic = time.monotonic()
         self._logger.info(
             f"Capture worker exiting normally. Total frames captured: "
-            f"{self.frames_successfully_captured_so_far}. Total dropped: "
-            f"{self.frames_dropped_due_to_capture_lag_so_far}. Total paused "
-            f"wall-clock seconds: "
-            f"{self.total_paused_wall_clock_seconds:.3f}."
+            f"{self.frames_successfully_captured_so_far}. Total dropped "
+            f"(capture lag): "
+            f"{self.frames_dropped_due_to_capture_lag_so_far}. Total "
+            f"dropped (pause-boundary slot collision): "
+            f"{self.frames_dropped_due_to_pause_boundary_slot_collision_so_far}. "
+            f"Total paused wall-clock seconds: "
+            f"{self.pause_duration_bookkeeper.total_paused_wall_clock_seconds(exit_log_now_monotonic):.3f}."
         )
 
 
@@ -4077,16 +4371,31 @@ class RecordingSessionController:
             "frames_captured": 0,
             "frames_encoded": 0,
             "frames_discarded_by_force_cancel": 0,
+            "frames_dropped_due_to_capture_lag": 0,
+            "frames_dropped_due_to_pause_boundary_slot_collision": 0,
             "total_paused_seconds": 0.0,
             "elapsed_wall_clock_seconds": 0.0,
             "elapsed_recorded_seconds": 0.0,
         }
         if capture is None or encoder is None:
             return empty_snapshot
-        start_monotonic = capture.recording_start_monotonic_seconds
+        # Sample ``time.monotonic()`` exactly once and pass the same
+        # value into every time-derived field, so the returned snapshot
+        # is internally consistent: ``elapsed_recorded_seconds`` is
+        # exactly ``elapsed_wall_clock_seconds - total_paused_seconds``
+        # without a sub-microsecond skew between the two reads. During
+        # a pause this is what makes the GUI's 'Recorded so far'
+        # counter freeze - both ``elapsed_wall_clock_seconds`` and
+        # ``total_paused_seconds`` advance at 1 sec/sec of wall clock,
+        # so their difference stays flat.
         now_monotonic = time.monotonic()
+        start_monotonic = capture.recording_start_monotonic_seconds
         elapsed_wall = (
             (now_monotonic - start_monotonic) if start_monotonic else 0.0
+        )
+        total_paused_seconds = (
+            capture.pause_duration_bookkeeper
+            .total_paused_wall_clock_seconds(now_monotonic)
         )
         return {
             "frames_captured": (
@@ -4098,13 +4407,18 @@ class RecordingSessionController:
             "frames_discarded_by_force_cancel": (
                 encoder.frames_discarded_due_to_force_cancel_so_far
             ),
-            "total_paused_seconds": (
-                capture.total_paused_wall_clock_seconds
+            "frames_dropped_due_to_capture_lag": (
+                capture.frames_dropped_due_to_capture_lag_so_far
             ),
+            "frames_dropped_due_to_pause_boundary_slot_collision": (
+                capture
+                .frames_dropped_due_to_pause_boundary_slot_collision_so_far
+            ),
+            "total_paused_seconds": total_paused_seconds,
             "elapsed_wall_clock_seconds": elapsed_wall,
             "elapsed_recorded_seconds": max(
                 0.0,
-                elapsed_wall - capture.total_paused_wall_clock_seconds,
+                elapsed_wall - total_paused_seconds,
             ),
         }
 
@@ -4134,33 +4448,68 @@ class RecordingSessionController:
             )
             self._lifecycle_thread.start()
 
-    def request_pause_capture(self) -> None:
-        with self._state_lock:
-            session = self._require_active_session_under_lock(
-                operation_name="Pause"
-            )
-            self._transition_state_under_lock(
-                from_states={
-                    RecordingLifecycleState.ACTIVELY_RECORDING_DISPLAY_1,
-                },
-                to_state=RecordingLifecycleState.PAUSED_BY_OPERATOR,
-            )
-            session.operator_pause_event.set()
+    def request_toggle_pause_or_resume(self) -> None:
+        """Pause if currently recording, resume if currently paused.
 
-    def request_resume_capture(self) -> None:
+        Atomic under ``_state_lock``: the toggle's direction is read
+        from the current lifecycle state and applied in the same
+        critical section, so a worker self-failure transitioning the
+        controller into FINALIZING between the GUI button click and
+        this call cannot leak through as an
+        ``IllegalRecordingStateTransitionError`` from a stale read.
+
+        Legal source states are ``ACTIVELY_RECORDING_DISPLAY_1`` and
+        ``PAUSED_BY_OPERATOR``. The GUI's button-config table at
+        ``_GUI_BUTTON_CONFIGURATION_PER_STATE`` keeps the Pause/Resume
+        button disabled in every other state; reaching this method
+        from any other state indicates a button-enabled-state mapping
+        defect and surfaces as an
+        ``IllegalRecordingStateTransitionError``.
+        """
         with self._state_lock:
             session = self._require_active_session_under_lock(
-                operation_name="Resume"
+                operation_name="Pause/Resume Toggle"
             )
-            self._transition_state_under_lock(
-                from_states={
-                    RecordingLifecycleState.PAUSED_BY_OPERATOR,
-                },
-                to_state=(
-                    RecordingLifecycleState.ACTIVELY_RECORDING_DISPLAY_1
-                ),
-            )
-            session.operator_pause_event.clear()
+            if (
+                self._current_state
+                == RecordingLifecycleState.ACTIVELY_RECORDING_DISPLAY_1
+            ):
+                self._transition_state_under_lock(
+                    from_states={
+                        RecordingLifecycleState
+                        .ACTIVELY_RECORDING_DISPLAY_1,
+                    },
+                    to_state=(
+                        RecordingLifecycleState.PAUSED_BY_OPERATOR
+                    ),
+                )
+                session.operator_pause_event.set()
+            elif (
+                self._current_state
+                == RecordingLifecycleState.PAUSED_BY_OPERATOR
+            ):
+                self._transition_state_under_lock(
+                    from_states={
+                        RecordingLifecycleState.PAUSED_BY_OPERATOR,
+                    },
+                    to_state=(
+                        RecordingLifecycleState
+                        .ACTIVELY_RECORDING_DISPLAY_1
+                    ),
+                )
+                session.operator_pause_event.clear()
+            else:
+                raise IllegalRecordingStateTransitionError(
+                    f"Pause/Resume toggle is legal only while the "
+                    f"controller is in "
+                    f"ACTIVELY_RECORDING_DISPLAY_1 or "
+                    f"PAUSED_BY_OPERATOR; observed "
+                    f"{self._current_state.name}. The GUI's "
+                    f"button-config table should have kept the "
+                    f"Pause/Resume button disabled in this state, "
+                    f"which is a programming error in the GUI's "
+                    f"state-to-button-enabled mapping."
+                )
 
     def request_graceful_stop_and_finalize(self) -> None:
         """Signal the lifecycle thread to finalize. Returns within microseconds."""
@@ -4950,8 +5299,33 @@ class RecordingSessionController:
                     if encoder_w is not None
                     else 0
                 ),
+                "frames_dropped_due_to_capture_lag_total": (
+                    capture_w.frames_dropped_due_to_capture_lag_so_far
+                    if capture_w is not None
+                    else 0
+                ),
+                "frames_dropped_due_to_pause_boundary_slot_collision_total": (
+                    capture_w
+                    .frames_dropped_due_to_pause_boundary_slot_collision_so_far
+                    if capture_w is not None
+                    else 0
+                ),
+                # ``total_paused_wall_clock_seconds`` is read through
+                # the pause bookkeeper's time-parameterised query, so
+                # the value is correct in all three reachable cases:
+                # (a) clean exit and Stop-during-pause - the worker's
+                #     ``finally`` already finalized any open segment,
+                #     so the query returns the worker-final value;
+                # (b) worker self-failure - the worker's ``finally``
+                #     still ran when its exception propagated, so the
+                #     value is final;
+                # (c) force-cancel-timeout (worker abandoned) - the
+                #     worker may still be inside the pause loop with
+                #     a segment open; the query honestly reports the
+                #     paused total as of this metadata-write instant.
                 "total_paused_wall_clock_seconds": (
-                    capture_w.total_paused_wall_clock_seconds
+                    capture_w.pause_duration_bookkeeper
+                    .total_paused_wall_clock_seconds(time.monotonic())
                     if capture_w is not None
                     else 0.0
                 ),
@@ -5882,34 +6256,20 @@ class _OperatorTkinterGui:
         )
 
     def _on_operator_pressed_pause_or_resume_button(self) -> None:
-        # The pause/resume button's command is the same callback in
-        # both states; the controller's state decides which transition.
-        current_state = self._controller.current_state
-        if (
-            current_state
-            == RecordingLifecycleState.ACTIVELY_RECORDING_DISPLAY_1
-        ):
-            self._invoke_controller_request_and_refresh(
-                controller_method=self._controller.request_pause_capture,
-                operation_description="Pause",
-            )
-        elif current_state == RecordingLifecycleState.PAUSED_BY_OPERATOR:
-            self._invoke_controller_request_and_refresh(
-                controller_method=self._controller.request_resume_capture,
-                operation_description="Resume",
-            )
-        else:
-            # The button should have been disabled in any other state;
-            # treat the click as a no-op-with-context.
-            tk_messagebox.showwarning(
-                title=f"{APP_DISPLAY_TITLE} - Unexpected state",
-                message=(
-                    f"The Pause / Resume button was clicked while the "
-                    f"controller was in state {current_state.name}. "
-                    f"The button should have been disabled in this "
-                    f"state; please report this as a GUI defect."
-                ),
-            )
+        # Single non-blocking call into the controller; the controller
+        # resolves "is this a pause or a resume?" atomically under its
+        # state lock, removing the read-then-act race a separate
+        # request_pause/request_resume API would have. Any unexpected
+        # state is surfaced through the controller's
+        # ``IllegalRecordingStateTransitionError`` rather than swallowed
+        # locally, because by construction the button is only enabled
+        # in the two valid states.
+        self._invoke_controller_request_and_refresh(
+            controller_method=(
+                self._controller.request_toggle_pause_or_resume
+            ),
+            operation_description="Pause/Resume Toggle",
+        )
 
     def _on_operator_pressed_stop_recording_button(self) -> None:
         self._invoke_controller_request_and_refresh(
@@ -6165,10 +6525,20 @@ class _OperatorTkinterGui:
                 f"encoded: {statistics['frames_encoded']}."
             )
         elif state == RecordingLifecycleState.PAUSED_BY_OPERATOR:
+            # 'Recorded so far' is intentionally frozen at the value
+            # it held when the worker observed the pause (the pause
+            # bookkeeper's time-parameterised total now grows in
+            # lockstep with wall-clock elapsed during pause, so their
+            # difference - elapsed_recorded_seconds - stays flat).
+            # The accompanying 'Paused for' field grows in real time
+            # so the operator can see at a glance that the recorder
+            # is responsive and has correctly observed the pause.
             status_line = (
                 "Status: Paused by operator.   "
                 f"Recorded so far: "
-                f"{_format_hms(statistics['elapsed_recorded_seconds'])}.   "
+                f"{_format_hms(statistics['elapsed_recorded_seconds'])} "
+                f"(frozen).   Paused for: "
+                f"{_format_hms(statistics['total_paused_seconds'])}.   "
                 f"Captured: {statistics['frames_captured']}   "
                 f"encoded: {statistics['frames_encoded']}."
             )
